@@ -10,7 +10,9 @@ import { useState, useRef, useEffect } from 'react'
 import { Copy, Share2 } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/empty-state'
 import { QRCodeDisplay, type QRCodeDisplayHandle } from './QRCodeDisplay'
+import { RECEIVE_ASSETS, buildPaymentUri, normalizeReceiveAmount } from '../models'
 
 // ---------------------------------------------------------------------------
 // useWalletAddress – returns address from prop → sessionStorage → empty string
@@ -50,6 +52,13 @@ export function ReceivePage({ address: addressProp }: ReceivePageProps) {
   // Memo state – kept in sync with copy-all and share actions.
   const [memo, setMemo] = useState('')
   const [showMemo, setShowMemo] = useState(false)
+
+  // Requested asset and amount – both feed the QR payload so a scanning wallet
+  // sees the same request the page shows.
+  const [assetCode, setAssetCode] = useState(RECEIVE_ASSETS[0].code)
+  const [amount, setAmount] = useState('')
+  const selectedAsset = RECEIVE_ASSETS.find((asset) => asset.code === assetCode) ?? RECEIVE_ASSETS[0]
+  const qrPayload = buildPaymentUri({ address, asset: selectedAsset, amount, memo })
 
   // Toast-style feedback flags.
   const [copiedAddress, setCopiedAddress] = useState(false)
@@ -150,13 +159,17 @@ export function ReceivePage({ address: addressProp }: ReceivePageProps) {
               /* #461 – real QR code rendered from the actual wallet address */
               <QRCodeDisplay
                 address={address}
+                payload={qrPayload}
                 size={256}
                 handleRef={qrHandleRef}
               />
             ) : (
-              <div className="w-64 h-64 flex items-center justify-center rounded-lg border-8 border-primary bg-white text-muted-foreground text-sm text-center p-4">
-                No wallet address found. Please log in to see your QR code.
-              </div>
+              <EmptyState
+                illustration="receive"
+                title="No wallet address yet"
+                description="Sign in to load your Stellar address and start receiving assets."
+                className="w-full border-0 bg-transparent p-0 sm:p-0"
+              />
             )}
             <div className="text-center">
               <p className="text-muted-foreground text-sm">
@@ -232,6 +245,44 @@ export function ReceivePage({ address: addressProp }: ReceivePageProps) {
               <Copy className="mr-2 h-4 w-4" />
               {copiedAddressMemo ? 'Copied!' : 'Copy Address + Memo'}
             </Button>
+          </div>
+
+          {/* Request Section – asset and optional amount encoded in the QR code */}
+          <div className="bg-card rounded-xl border border-border p-6 space-y-4">
+            <h3 className="font-semibold text-foreground">Payment Request</h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <label className="space-y-2 text-sm font-medium text-foreground">
+                Asset
+                <select
+                  value={assetCode}
+                  onChange={(e) => setAssetCode(e.target.value)}
+                  aria-label="Asset to receive"
+                  className="w-full px-4 py-3 rounded-lg bg-muted/50 border border-border text-foreground focus:outline-none focus:border-primary"
+                >
+                  {RECEIVE_ASSETS.map((asset) => (
+                    <option key={asset.code} value={asset.code}>
+                      {asset.code}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="space-y-2 text-sm font-medium text-foreground">
+                Amount (optional)
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="0.00"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  aria-label="Amount to request"
+                  aria-invalid={amount !== '' && !normalizeReceiveAmount(amount)}
+                  className="w-full px-4 py-3 rounded-lg bg-muted/50 border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary"
+                />
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              The QR code includes the selected asset, amount and memo.
+            </p>
           </div>
 
           {/* Memo Section */}

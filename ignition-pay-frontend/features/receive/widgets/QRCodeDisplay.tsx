@@ -15,6 +15,11 @@ export interface QRCodeDisplayHandle {
 interface QRCodeDisplayProps {
   /** The Stellar wallet address (or any string) to encode. */
   address: string
+  /**
+   * What the QR code encodes. Defaults to `address`. The Receive page passes a
+   * payment URI here so the code carries the selected asset, amount and memo.
+   */
+  payload?: string
   /** Canvas size in pixels – width and height are equal. Defaults to 256. */
   size?: number
   /** Optional ref that exposes the downloadQR helper to the parent. */
@@ -28,19 +33,23 @@ interface QRCodeDisplayProps {
  * - Provides a built-in Download button and exposes downloadQR() to parents
  *   via the optional `handleRef` prop.
  */
-export function QRCodeDisplay({ address, size = 256, handleRef }: QRCodeDisplayProps) {
+export function QRCodeDisplay({ address, payload, size = 256, handleRef }: QRCodeDisplayProps) {
+  const encoded = payload ?? address
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Generate the QR code whenever the address or size changes.
+  // Re-generate whenever what is encoded (address, asset, amount, memo) or the size changes.
   useEffect(() => {
     // SSR guard – canvas APIs only exist in the browser.
     if (typeof window === 'undefined') return
-    if (!address) {
+    if (!encoded) {
       setLoading(false)
       return
     }
+
+    // A slow earlier render must not paint over, or report on, a newer selection.
+    let cancelled = false
 
     setLoading(true)
     setError(null)
@@ -49,20 +58,27 @@ export function QRCodeDisplay({ address, size = 256, handleRef }: QRCodeDisplayP
     import('qrcode')
       .then((QRCode) => {
         const canvas = canvasRef.current
-        if (!canvas) return
-        return QRCode.toCanvas(canvas, address, {
+        if (cancelled || !canvas) return
+        return QRCode.toCanvas(canvas, encoded, {
           width: size,
           margin: 2,
           color: { dark: '#000000', light: '#ffffff' },
         })
       })
-      .then(() => setLoading(false))
+      .then(() => {
+        if (!cancelled) setLoading(false)
+      })
       .catch((err) => {
+        if (cancelled) return
         console.error('[QRCodeDisplay] Failed to generate QR code:', err)
         setError('Failed to generate QR code')
         setLoading(false)
       })
-  }, [address, size])
+
+    return () => {
+      cancelled = true
+    }
+  }, [encoded, size])
 
   // Expose downloadQR to the parent component through the optional ref.
   const downloadQR = useCallback(() => {

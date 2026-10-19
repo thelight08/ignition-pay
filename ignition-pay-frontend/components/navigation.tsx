@@ -4,16 +4,21 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { Wallet, Send, ArrowDownUp, History, Anchor, Settings, Menu, X, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useState, useEffect, useCallback } from 'react'
+import { Badge } from '@/components/ui/badge'
 
 import { useTranslation } from '@/lib/i18n'
+import { useTransactionQueueCount } from '@/lib/useTransactionQueueCount'
 
+// `tour` is the `data-tour` target the onboarding tour highlights. Every nav
+// entry is marked up in all three renderings below, so the tour always has an
+// anchor to point at on both the sidebar and the mobile tab bar.
 const navItemsDef = [
-  { href: '/dashboard', translationKey: 'common.dashboard', defaultLabel: 'Dashboard', icon: Wallet },
-  { href: '/send', translationKey: 'common.send', defaultLabel: 'Send', icon: Send },
-  { href: '/receive', translationKey: 'common.receive', defaultLabel: 'Receive', icon: ArrowDownUp },
-  { href: '/history', translationKey: 'common.history', defaultLabel: 'History', icon: History },
-  { href: '/anchors', translationKey: 'common.anchors', defaultLabel: 'Anchors', icon: Anchor },
-  { href: '/settings', translationKey: 'common.settings', defaultLabel: 'Settings', icon: Settings },
+  { href: '/dashboard', tour: 'dashboard', translationKey: 'common.dashboard', defaultLabel: 'Dashboard', icon: Wallet },
+  { href: '/send', tour: 'send', translationKey: 'common.send', defaultLabel: 'Send', icon: Send },
+  { href: '/receive', tour: 'receive', translationKey: 'common.receive', defaultLabel: 'Receive', icon: ArrowDownUp },
+  { href: '/history', tour: 'history', translationKey: 'common.history', defaultLabel: 'History', icon: History },
+  { href: '/anchors', tour: 'anchors', translationKey: 'common.anchors', defaultLabel: 'Anchors', icon: Anchor },
+  { href: '/settings', tour: 'settings', translationKey: 'common.settings', defaultLabel: 'Settings', icon: Settings },
 ]
 
 const SIDEBAR_COLLAPSED_KEY = 'sidebar-collapsed'
@@ -32,6 +37,7 @@ export function Navigation() {
   const pathname = usePathname()
   const [isOpen, setIsOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(getInitialCollapsed)
+  const queueCount = useTransactionQueueCount()
 
   const navItems = navItemsDef.map((item) => ({
     ...item,
@@ -80,6 +86,7 @@ export function Navigation() {
                 <Link
                   key={item.href}
                   href={item.href}
+                  data-tour={item.tour}
                   onClick={() => setIsOpen(false)}
                   className={`flex items-center gap-3 px-4 py-3 text-sm font-medium border-b border-border last:border-b-0 transition-colors ${
                     isActive
@@ -105,16 +112,28 @@ export function Navigation() {
           {bottomTabs.map((item) => {
             const Icon = item.icon
             const isActive = pathname === item.href
+            const showQueueBadge = item.href === '/send' && queueCount > 0
             return (
               <li key={item.href}>
                 <Link
                   href={item.href}
+                  data-tour={item.tour}
                   aria-current={isActive ? 'page' : undefined}
                   className={`flex flex-col items-center justify-center gap-1 py-2.5 text-xs font-medium transition-colors ${
                     isActive ? 'text-primary' : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
-                  <Icon size={20} aria-hidden="true" />
+                  <div className="relative">
+                    <Icon size={20} aria-hidden="true" />
+                    {showQueueBadge && (
+                      <Badge
+                        variant="destructive"
+                        className="absolute -top-1 -right-1 h-4 w-4 flex items-center justify-center p-0 text-[10px]"
+                      >
+                        {queueCount}
+                      </Badge>
+                    )}
+                  </div>
                   {item.label}
                 </Link>
               </li>
@@ -140,10 +159,12 @@ export function Navigation() {
           {navItems.map((item) => {
             const Icon = item.icon
             const isActive = pathname === item.href
+            const showQueueBadge = item.href === '/send' && queueCount > 0
             return (
               <Link
                 key={item.href}
                 href={item.href}
+                data-tour={item.tour}
                 title={collapsed ? item.label : undefined}
                 className={`flex items-center gap-3 rounded-lg font-medium transition-all ${
                   collapsed ? 'justify-center px-2 py-3' : 'px-4 py-3'
@@ -153,7 +174,17 @@ export function Navigation() {
                     : 'text-foreground hover:bg-muted'
                 }`}
               >
-                <Icon size={20} className="flex-shrink-0" />
+                <div className="relative">
+                  <Icon size={20} className="flex-shrink-0" />
+                  {showQueueBadge && (
+                    <Badge
+                      variant="destructive"
+                      className="absolute -top-1 -right-1 h-4 w-4 flex items-center justify-center p-0 text-[10px]"
+                    >
+                      {queueCount}
+                    </Badge>
+                  )}
+                </div>
                 {!collapsed && <span>{item.label}</span>}
               </Link>
             )

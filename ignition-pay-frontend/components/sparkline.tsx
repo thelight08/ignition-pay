@@ -1,5 +1,8 @@
 interface SparklineProps {
-  /** Values ordered oldest to newest. Fewer than two points renders nothing. */
+  /**
+   * Values ordered oldest to newest. Non-finite values (NaN, Infinity) are
+   * dropped; fewer than two usable points renders nothing.
+   */
   points: number[]
   label: string
   trend?: 'up' | 'down' | 'flat'
@@ -15,7 +18,14 @@ const TREND_COLORS = {
   flat: 'text-muted-foreground',
 } as const
 
-export function Sparkline({ points, label, trend = 'flat', className }: SparklineProps) {
+/** Keeps only finite numbers so a bad sample can't poison min/max (NaN) and the path. */
+export function sanitizeSparklinePoints(points: readonly number[] | null | undefined): number[] {
+  if (!Array.isArray(points)) return []
+  return points.filter((point): point is number => typeof point === 'number' && Number.isFinite(point))
+}
+
+export function Sparkline({ points: rawPoints, label, trend = 'flat', className }: SparklineProps) {
+  const points = sanitizeSparklinePoints(rawPoints)
   if (points.length < 2) return null
 
   const min = Math.min(...points)

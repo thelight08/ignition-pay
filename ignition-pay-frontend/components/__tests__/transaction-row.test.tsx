@@ -416,3 +416,30 @@ describe('TransactionRow', () => {
     })
   })
 })
+
+describe('TransactionRow timestamp timezone (#872)', () => {
+  const tx: Transaction = {
+    id: 'tx-tz',
+    type: 'sent',
+    asset: 'XLM',
+    amount: 1,
+    recipient: 'GBJCHUKZMTFSLOMNC7P4TS4VJJBTCYL3YCWKEANE7FCNHWHP6ZPWPX3',
+    timestamp: new Date('2024-01-01T12:00:00Z'),
+    status: 'confirmed',
+  }
+
+  it('names the timezone next to the time', () => {
+    render(<TransactionRow transaction={tx} />)
+    const time = screen.getByText(/Jan 1/)
+    // e.g. "Jan 1, 12:00 PM UTC" / "GMT+1" – a zone label always follows the time.
+    expect(time.textContent).toMatch(/\d{2}:\d{2}.*(UTC|GMT|[A-Z]{2,5})/)
+  })
+
+  it('exposes the exact UTC instant for comparison with Horizon', () => {
+    render(<TransactionRow transaction={tx} />)
+    const time = screen.getByText(/Jan 1/)
+    expect(time.tagName).toBe('TIME')
+    expect(time).toHaveAttribute('datetime', '2024-01-01T12:00:00.000Z')
+    expect(time).toHaveAttribute('title', '2024-01-01T12:00:00.000Z (UTC)')
+  })
+})

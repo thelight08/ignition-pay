@@ -31,6 +31,39 @@ const translations: Record<SupportedLocale, TranslationDictionary> = {
       refunded: 'Refunded',
       confirmed: 'Confirmed',
     },
+    onboardingTour: {
+      stepCounter: 'Step {{current}} of {{total}}',
+      skip: 'Skip tour',
+      back: 'Back',
+      next: 'Next',
+      done: 'Done',
+      replay: 'Replay tour',
+      steps: {
+        send: {
+          title: 'Send payments',
+          description: 'Move XLM or any Stellar asset to a public address. Fees settle in seconds.',
+        },
+        receive: {
+          title: 'Receive funds',
+          description: 'Share a QR code or your address to get paid. Anchored assets arrive as trustlines.',
+        },
+        balance: {
+          title: 'Watch your balance',
+          description: 'Your total portfolio value, 24 hour change and last refresh time live here.',
+        },
+        history: {
+          title: 'Follow your history',
+          description: 'Every payment you send or receive is listed with its status and confirmations.',
+        },
+        appearance: {
+          title: 'Make it yours',
+          description: 'Switch between light, dark and your system theme. High contrast is remembered too.',
+        },
+      },
+    },
+    wallet: {
+      networkSwitched: 'Your wallet switched to {{network}}. Balances were refreshed.',
+    },
     dashboard: {
       title: 'Dashboard',
       welcome: "Welcome back! Here's your wallet overview.",
@@ -129,6 +162,39 @@ const translations: Record<SupportedLocale, TranslationDictionary> = {
       refunded: 'Reembolsado',
       confirmed: 'Confirmado',
     },
+    onboardingTour: {
+      stepCounter: 'Paso {{current}} de {{total}}',
+      skip: 'Omitir recorrido',
+      back: 'Atrás',
+      next: 'Siguiente',
+      done: 'Listo',
+      replay: 'Repetir recorrido',
+      steps: {
+        send: {
+          title: 'Enviar pagos',
+          description: 'Envía XLM o cualquier activo de Stellar a una dirección pública. Las comisiones se liquidan en segundos.',
+        },
+        receive: {
+          title: 'Recibir fondos',
+          description: 'Comparte un código QR o tu dirección para cobrar. Los activos de anclas llegan como líneas de confianza.',
+        },
+        balance: {
+          title: 'Controla tu saldo',
+          description: 'El valor total de tu cartera, el cambio en 24 horas y la hora de la última actualización están aquí.',
+        },
+        history: {
+          title: 'Sigue tu historial',
+          description: 'Cada pago que envías o recibes aparece con su estado y confirmaciones.',
+        },
+        appearance: {
+          title: 'Hazlo tuyo',
+          description: 'Cambia entre el tema claro, el oscuro o el del sistema. El alto contraste también se recuerda.',
+        },
+      },
+    },
+    wallet: {
+      networkSwitched: 'Tu billetera cambió a {{network}}. Se actualizaron los saldos.',
+    },
     dashboard: {
       title: 'Panel Principal',
       welcome: '¡Bienvenido de nuevo! Aquí tienes el resumen de tu billetera.',
@@ -226,6 +292,39 @@ const translations: Record<SupportedLocale, TranslationDictionary> = {
       failed: 'Échoué',
       refunded: 'Remboursé',
       confirmed: 'Confirmé',
+    },
+    onboardingTour: {
+      stepCounter: 'Étape {{current}} sur {{total}}',
+      skip: 'Passer la visite',
+      back: 'Retour',
+      next: 'Suivant',
+      done: 'Terminé',
+      replay: 'Rejouer la visite',
+      steps: {
+        send: {
+          title: 'Envoyer des paiements',
+          description: 'Envoyez des XLM ou tout actif Stellar vers une adresse publique. Les frais sont réglés en quelques secondes.',
+        },
+        receive: {
+          title: 'Recevoir des fonds',
+          description: "Partagez un code QR ou votre adresse pour être payé. Les actifs d'ancrage arrivent sous forme de lignes de confiance.",
+        },
+        balance: {
+          title: 'Suivez votre solde',
+          description: "La valeur totale de votre portefeuille, la variation sur 24 heures et l'heure de la dernière actualisation se trouvent ici.",
+        },
+        history: {
+          title: 'Consultez votre historique',
+          description: 'Chaque paiement envoyé ou reçu est listé avec son statut et ses confirmations.',
+        },
+        appearance: {
+          title: 'Personnalisez',
+          description: 'Passez du thème clair au thème sombre ou à celui du système. Le contraste élevé est également mémorisé.',
+        },
+      },
+    },
+    wallet: {
+      networkSwitched: 'Votre portefeuille est passé sur {{network}}. Les soldes ont été actualisés.',
     },
     dashboard: {
       title: 'Tableau de bord',

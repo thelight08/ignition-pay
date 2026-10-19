@@ -11,6 +11,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { LoggingInterceptor } from './common/logging/logging.interceptor';
 import { LoggerModule } from './common/logging/logger.module';
+import { ApiKeyScopeInterceptor } from './api-keys/api-key-gateway.interceptor';
 import { PrismaModule } from './prisma/prisma.module';
 import { QueueModule } from './queue/queue.module';
 import { RedisModule } from './redis/redis.module';
@@ -35,6 +36,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { Sep24Module } from './sep24/sep24.module';
 import { SettingsModule } from './settings/settings.module';
 import { Sep38Module } from './sep38/sep38.module';
+import { ShutdownModule } from './common/shutdown/shutdown.module';
 
 @Module({
   imports: [
@@ -43,6 +45,7 @@ import { Sep38Module } from './sep38/sep38.module';
     }),
     CryptoModule,
     LoggerModule,
+    ShutdownModule,
     PrismaModule,
     QueueModule,
     RedisModule,
@@ -74,6 +77,10 @@ import { Sep38Module } from './sep38/sep38.module';
     {
       provide: APP_INTERCEPTOR,
       useClass: LoggingInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ApiKeyScopeInterceptor,
     },
   ],
 })

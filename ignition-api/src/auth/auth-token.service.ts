@@ -15,6 +15,7 @@ import { UserRole } from '@prisma/client';
 import { LoginResponseDto } from '../users/dto/login.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionsService } from './permissions/permissions.service';
+import { SettingsService } from '../settings/settings.service';
 
 // Minimal user shape that AuthTokenService needs to mint/revoke tokens.
 // Allows callers (auth-verify.controller, users.service.login) to pass
@@ -29,6 +30,9 @@ interface RefreshTokenPayload {
   sub: string;
   fid?: string; // Issue #226: token-family ID for reuse detection
   sid?: string;
+  // Unique per token so two rotations within the same second never produce
+  // byte-identical tokens (which would defeat reuse detection).
+  jti?: string;
   iat?: number;
   exp?: number;
 }
@@ -115,7 +119,12 @@ export class AuthTokenService {
      */
     familyId?: string,
   ): Promise<LoginResponseDto> {
+    // Security: revoke any existing refresh tokens for this user before issuing
+    // a new pair. Prevents multiple valid token chains and replay attacks.
     const walletAddress = user.walletAddress ?? '';
+    if (walletAddress) {
+      await this.revokeAllTokensForUser(walletAddress);
+    }
     const fid = familyId ?? randomUUID();
     
     // Get current session settings from database
@@ -132,21 +141,19 @@ export class AuthTokenService {
     };
 
     const accessToken = this.jwt.sign(accessPayload, {
-      secret: this.config.get<string>('JWT_SECRET', 'default-secret'),
+      secret: this.config.getOrThrow<string>('JWT_SECRET'),
       expiresIn: `${accessTtlSeconds}s`,
     });
 
     const refreshPayload: RefreshTokenPayload = {
       sub: user.id,
       fid,
+      jti: randomUUID(),
       ...(sessionId ? { sid: sessionId } : {}),
     };
 
     const refreshToken = this.jwt.sign(refreshPayload, {
-      secret: this.config.get<string>(
-        'REFRESH_TOKEN_SECRET',
-        'default-refresh-secret',
-      ),
+      secret: this.config.getOrThrow<string>('REFRESH_TOKEN_SECRET'),
       expiresIn: `${refreshTtlSeconds}s`,
     });
 
@@ -193,10 +200,7 @@ export class AuthTokenService {
 
     try {
       payload = this.jwt.verify(refreshToken, {
-        secret: this.config.get<string>(
-          'REFRESH_TOKEN_SECRET',
-          'default-refresh-secret',
-        ),
+        secret: this.config.getOrThrow<string>('REFRESH_TOKEN_SECRET'),
       });
     } catch (err: unknown) {
       if (
@@ -298,7 +302,7 @@ export class AuthTokenService {
     };
 
     const accessToken = this.jwt.sign(rotationPayload, {
-      secret: this.config.get<string>('JWT_SECRET', 'default-secret'),
+      secret: this.config.getOrThrow<string>('JWT_SECRET'),
       expiresIn: `${accessTtlSeconds}s`,
     });
 
@@ -308,13 +312,11 @@ export class AuthTokenService {
     const newRefreshPayload: RefreshTokenPayload = {
       sub: user.id,
       fid: currentFamilyId,
+      jti: randomUUID(),
     };
 
     const newRefreshToken = this.jwt.sign(newRefreshPayload, {
-      secret: this.config.get<string>(
-        'REFRESH_TOKEN_SECRET',
-        'default-refresh-secret',
-      ),
+      secret: this.config.getOrThrow<string>('REFRESH_TOKEN_SECRET'),
       expiresIn: `${refreshTtlSeconds}s`,
     });
 

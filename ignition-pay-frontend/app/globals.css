@@ -25,6 +25,7 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -72,6 +73,15 @@
   --accent: oklch(0.97 0 0);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
+  /*
+   * Foreground for the `destructive` tinted surfaces (`bg-destructive/10`,
+   * used by the destructive Button variant and the destructive Badge).
+   * `--destructive` itself is tuned to read against `--background`, so on its
+   * own tint it only reaches 3.99:1. This darker red reaches 7.01:1 at rest
+   * and 5.82:1 on `hover:bg-destructive/20`. Enforced by
+   * `tests/color-contrast.test.ts`.
+   */
+  --destructive-foreground: oklch(0.444 0.177 26.899);
   --success: oklch(0.627 0.194 149.214);
   --success-foreground: oklch(0.985 0 0);
   --warning: oklch(0.8 0.15 80);
@@ -111,6 +121,13 @@
   --muted-foreground: oklch(0.64 0 0);
   --accent-foreground: oklch(0.08 0 0);
   --destructive: oklch(0.704 0.191 22.216);
+  /*
+   * Dark-mode counterpart of the light `--destructive-foreground` above. The
+   * dark tint already cleared 4.5:1 (5.72:1 at rest) but only by a small
+   * margin on `--card` (4.55:1 on `hover:bg-destructive/30`); this lighter red
+   * raises the pair to 8.62:1 / 7.10:1.
+   */
+  --destructive-foreground: oklch(0.808 0.114 19.571);
   --success: oklch(0.627 0.194 149.214);
   --success-foreground: oklch(0.95 0 0);
   --warning: oklch(0.769 0.188 70.08);
@@ -180,5 +197,15 @@
   }
   html {
     @apply font-sans;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
   }
 }

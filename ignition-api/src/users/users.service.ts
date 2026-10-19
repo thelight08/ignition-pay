@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   BadRequestException,
   UnauthorizedException,
@@ -21,6 +22,8 @@ import { RegisterResponseDto } from './dto/register-response.dto';
 import { SessionService } from '../session/session.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UserProfileDto, PublicUserProfileDto } from './dto/user-profile.dto';
+import { UserDashboardDto } from './dto/dashboard.dto';
+import { DashboardCacheService } from './dashboard-cache.service';
 import { assertStrongPassword } from './password-policy';
 
 interface PasswordSetupInput {
@@ -55,12 +58,15 @@ const userProfileInclude = {
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     @Inject(CACHE_MANAGER) private readonly cache: Keyv,
     private readonly sessionService: SessionService,
+    private readonly dashboardCache: DashboardCacheService,
   ) {}
 
   /**
@@ -103,6 +109,115 @@ export class UsersService {
       totalRaised,
       totalDonated,
       campaignCount: user.campaigns.length,
+    };
+  }
+
+  /**
+   * Get authenticated user's dashboard: profile, wallets, recent
+   * transactions, unread notifications and active campaigns in a single
+   * $transaction with parallel, selectively-projected queries instead of
+   * six sequential round trips.
+   *
+   * Issue #591 — the aggregated payload is served from the warmed cache when
+   * available. On a cache miss (cold start, eviction, invalidation) we fall
+   * back to live computation and repopulate the cache, so there is no
+   * downtime and no user-visible error.
+   */
+  async getDashboard(walletAddress: string): Promise<UserDashboardDto> {
+    const user = await this.prisma.user.findFirst({
+      where: { walletAddress, deletedAt: null },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const cached = await this.dashboardCache.get(user.id);
+    if (cached) {
+      return cached;
+    }
+
+    const dashboard = await this.computeDashboard(user.id);
+    await this.dashboardCache.set(user.id, dashboard);
+    return dashboard;
+  }
+
+  /**
+   * Live dashboard computation used on cache miss and by the scheduled
+   * cache-warming job.
+   */
+  async computeDashboard(userId: string): Promise<UserDashboardDto> {
+    const [profile, wallets, recentTransactions, unreadNotifications, activeCampaigns] =
+      await this.prisma.$transaction([
+        this.prisma.user.findUniqueOrThrow({
+          where: { id: userId },
+          select: {
+            id: true,
+            email: true,
+            displayName: true,
+            avatarUrl: true,
+            role: true,
+            kycStatus: true,
+          },
+        }),
+        this.prisma.wallet.findMany({
+          where: { userId, deletedAt: null },
+          select: { id: true, network: true, balance: true, currency: true, status: true },
+        }),
+        this.prisma.transaction.findMany({
+          where: {
+            OR: [
+              { fromWallet: { userId } },
+              { toWallet: { userId } },
+            ],
+          },
+          select: { id: true, amount: true, assetCode: true, status: true, createdAt: true },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }),
+        this.prisma.notification.findMany({
+          where: { userId, isRead: false },
+          select: { id: true, type: true, title: true, createdAt: true },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }),
+        this.prisma.campaign.findMany({
+          where: { creatorId: userId, status: 'ACTIVE' },
+          select: { id: true, title: true, goalAmount: true, raisedAmount: true },
+        }),
+      ]);
+
+    return {
+      profile: {
+        id: profile.id,
+        email: profile.email ?? undefined,
+        displayName: profile.displayName ?? undefined,
+        avatarUrl: profile.avatarUrl ?? undefined,
+        role: profile.role,
+        kycStatus: profile.kycStatus,
+      },
+      wallets: wallets.map((w) => ({
+        id: w.id,
+        network: w.network,
+        balance: w.balance.toString(),
+        currency: w.currency,
+        status: w.status,
+      })),
+      recentTransactions: recentTransactions.map((t) => ({
+        id: t.id,
+        amount: t.amount.toString(),
+        assetCode: t.assetCode,
+        status: t.status,
+        createdAt: t.createdAt,
+      })),
+      unreadNotifications,
+      activeCampaigns: activeCampaigns.map((c) => ({
+        id: c.id,
+        title: c.title,
+        goalAmount: c.goalAmount.toString(),
+        raisedAmount: c.raisedAmount.toString(),
+      })),
     };
   }
 
@@ -370,10 +485,7 @@ export class UsersService {
         sid: session.sessionId,
       },
       {
-        secret: this.config.get<string>(
-          'JWT_SECRET',
-          'stellaraid-default-secret',
-        ),
+        secret: this.config.getOrThrow<string>('JWT_SECRET'),
         expiresIn: `${accessTtlSeconds}s`,
       },
     );
@@ -386,10 +498,7 @@ export class UsersService {
     const refreshToken = this.jwt.sign(
       { sub: user.id, sid: session.sessionId },
       {
-        secret: this.config.get<string>(
-          'REFRESH_TOKEN_SECRET',
-          'default-refresh-secret',
-        ),
+        secret: this.config.getOrThrow<string>('REFRESH_TOKEN_SECRET'),
         expiresIn: `${sessionTtlSeconds}s`,
       },
     );
@@ -526,11 +635,12 @@ export class UsersService {
     const token = this.generateConfirmationToken();
     const tokenHash = this.hashToken(token);
 
-    const expiresHours = this.config.get<number>(
-      'EMAIL_TOKEN_EXPIRES_HOURS',
-      24,
-    );
-    const expiresAt = new Date(Date.now() + expiresHours * 60 * 60 * 1000);
+    const expiresAt = this.emailTokenExpiresAt();
+
+    // Issue #617 — invalidate any token already issued for this user so at
+    // most one is ever usable. Marked used rather than deleted so the row
+    // survives as an audit record of the superseded link.
+    await this.invalidateActiveEmailTokens(user.id);
 
     await this.prisma.emailVerificationToken.create({
       data: {
@@ -547,6 +657,11 @@ export class UsersService {
 
   /**
    * POST /users/confirm-email
+   *
+   * Issue #617 — the claim is a single conditional `updateMany`, so exactly
+   * one concurrent caller can transition a token out of `usedAt: null`. The
+   * previous read-then-write was not atomic: two in-flight confirmations could
+   * both observe `usedAt: null` and both succeed.
    */
   async confirmEmail(token: string): Promise<RegisterResponseDto> {
     if (!token) {
@@ -555,35 +670,97 @@ export class UsersService {
 
     const tokenHash = this.hashToken(token);
 
+    // Read first, to learn the user id and to fail fast on an unknown token.
+    // A row that is missing, already used or already expired is reported
+    // identically, so the endpoint does not tell a caller guessing token
+    // values which of the three it hit.
     const verification = await this.prisma.emailVerificationToken.findUnique({
-      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
-      include: { user: true },
+      where: { tokenHash },
     });
 
-    if (!verification || !verification.user) {
+    if (!verification || !verification.userId) {
       throw new BadRequestException('Invalid or expired token');
     }
 
-    if (verification.usedAt) {
-      throw new BadRequestException('Token already used');
-    }
+    // Atomic claim: one statement, guarded by the same `usedAt: null`
+    // predicate, so the row is claimed only if nobody claimed it first.
+    // `tokenHash` is unique, so a zero-row result means the token is already
+    // used or already expired — it can no longer be redeemed either way.
+    const claimed = await this.prisma.emailVerificationToken.updateMany({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: new Date() } },
+      data: { usedAt: new Date() },
+    });
 
-    if (verification.expiresAt <= new Date()) {
+    if (claimed.count === 0) {
       throw new BadRequestException('Invalid or expired token');
     }
 
-    await this.prisma.$transaction([
-      this.prisma.emailVerificationToken.update({
-        where: { tokenHash },
-        data: { usedAt: new Date() },
-      }),
-      this.prisma.user.update({
-        where: { id: verification.userId },
-        data: { emailVerifiedAt: new Date() },
-      }),
-    ]);
+    await this.prisma.user.update({
+      where: { id: verification.userId },
+      data: { emailVerifiedAt: new Date() },
+    });
 
     return { message: 'Email confirmed successfully.' };
+  }
+
+  /**
+   * Issue #617 — mark every still-usable verification token for `userId` as
+   * used, so issuing a new token revokes the previous one without deleting
+   * the row: the `usedAt` stamp is the audit trail.
+   */
+  private async invalidateActiveEmailTokens(userId: string): Promise<void> {
+    await this.prisma.emailVerificationToken.updateMany({
+      where: { userId, usedAt: null },
+      data: { usedAt: new Date() },
+    });
+  }
+
+  /** Absolute expiry for a newly issued email verification token. */
+  private emailTokenExpiresAt(): Date {
+    const expiresHours = this.config.get<number>(
+      'EMAIL_TOKEN_EXPIRES_HOURS',
+      24,
+    );
+
+    return new Date(Date.now() + expiresHours * 60 * 60 * 1000);
+  }
+
+  /**
+   * Issue #617 — delete tokens that expired, or that were used, more than
+   * `retentionDays` ago (default `EMAIL_TOKEN_RETENTION_DAYS`, 30). This keeps
+   * the table bounded while preserving a short audit trail. Invoked on startup
+   * and then periodically by `EmailVerificationTokenScheduler`.
+   *
+   * @returns the number of rows removed.
+   */
+  async purgeExpiredEmailVerificationTokens(
+    retentionDays: number = this.emailTokenRetentionDays(),
+  ): Promise<number> {
+    const cutoff = new Date(
+      Date.now() - Math.max(retentionDays, 0) * 24 * 60 * 60 * 1000,
+    );
+
+    const { count } = await this.prisma.emailVerificationToken.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lt: cutoff } }, { usedAt: { lt: cutoff } }],
+      },
+    });
+
+    if (count > 0) {
+      this.logger.log(
+        `Purged ${count} email verification token(s) older than ${cutoff.toISOString()}`,
+      );
+    }
+
+    return count;
+  }
+
+  /** Retention window for used/expired tokens, in days. */
+  private emailTokenRetentionDays(): number {
+    const configured = Number(
+      this.config.get('EMAIL_TOKEN_RETENTION_DAYS', 30),
+    );
+    return Number.isFinite(configured) && configured >= 0 ? configured : 30;
   }
 
   /**

@@ -9,12 +9,49 @@ import {
   GetTransactionsQueryDto,
   GetTransactionsResponseDto,
   SubmitTransactionDto,
+  SubmitTransactionResponseDto,
   TransactionDto,
 } from './dto/get-transactions.dto';
+import {
+  IdempotencyService,
+  isValidIdempotencyKey,
+} from './idempotency.service';
+import { WalletNetwork } from '../wallets/dto/create-wallet.dto';
+import {
+  isValidNetworkAddress,
+  isValidNetworkIssuer,
+} from '../wallets/network-address.validator';
+
+const NETWORK_FEES: Record<WalletNetwork, { amount: string; asset: string }> = {
+  [WalletNetwork.STELLAR]: { amount: '0.0000100', asset: 'XLM' },
+  [WalletNetwork.ETHEREUM]: { amount: '0.0001000', asset: 'ETH' },
+  [WalletNetwork.BITCOIN]: { amount: '0.0000100', asset: 'BTC' },
+};
+
+// ---------------------------------------------------------------------------
+// Cursor helpers
+// Cursor is an opaque base64-encoded string that wraps the internal record id.
+// This satisfies the requirement: "Cursor is opaque (not exposed internal IDs)".
+// ---------------------------------------------------------------------------
+
+function encodeCursor(id: string): string {
+  return Buffer.from(id, 'utf8').toString('base64');
+}
+
+function decodeCursor(cursor: string): string {
+  try {
+    return Buffer.from(cursor, 'base64').toString('utf8');
+  } catch {
+    throw new BadRequestException('Invalid cursor');
+  }
+}
 
 @Injectable()
 export class TransactionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   async getTransactions(
     query: GetTransactionsQueryDto,
@@ -22,18 +59,14 @@ export class TransactionsService {
     const { cursor, limit, dateFrom, dateTo, status, type, asset, search } =
       query;
 
-    // ── Issue #411: Cursor pagination ──────────────────────────────────────
-    // When `cursor` is provided, fetch transactions created after the cursor
-    // (using created_at + id to avoid drift when new rows are inserted).
-    // When omitted, fall back to page-based offset pagination for backward
-    // compatibility.
-    const useCursorPagination = !!cursor;
+    // ── Build the WHERE clause ──────────────────────────────────────────────
 
     const where: Prisma.TransactionWhereInput = {};
 
     if (status) where.status = status as any;
-    // `type` was historically mapped to assetCode; `asset` is the new explicit filter.
-    // When both are provided, `asset` wins.
+
+    // `type` was historically mapped to assetCode; `asset` is the new explicit
+    // filter. When both are provided, `asset` wins.
     const assetFilter = asset ?? type;
     if (assetFilter) {
       where.assetCode = { equals: assetFilter, mode: 'insensitive' };
@@ -46,8 +79,8 @@ export class TransactionsService {
       };
     }
 
-    // Free-text search: match on txHash (exact, case-insensitive) or donorId
-    // (partial, for counterparty address look-up).
+    // Free-text search: match on txHash (exact, case-insensitive) or
+    // counterparty wallet address (partial).
     if (search) {
       where.OR = [
         { stellarTxHash: { equals: search, mode: 'insensitive' } },
@@ -56,46 +89,31 @@ export class TransactionsService {
       ];
     }
 
-    // Fetch one extra row so we can tell whether another page exists
-    // without running a separate COUNT query.
-    const transactions = await this.prisma.transaction.findMany({
-      where,
-      select: {
-        id: true,
-        fromWalletId: true,
-        toWalletId: true,
-        amount: true,
-        assetCode: true,
-        stellarTxHash: true,
-        status: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-      orderBy: { createdAt: 'desc' },
-      // When a cursor is supplied, start after that record.
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      take: limit + 1,
-    });
+    // ── Cursor seek ─────────────────────────────────────────────────────────
+    // Decode the opaque cursor to recover the internal id, then look up the
+    // (createdAt, id) values for that row so we can do a compound seek that
+    // remains stable under concurrent inserts.
 
-    const hasNextPage = transactions.length > limit;
-    const page = hasNextPage ? transactions.slice(0, limit) : transactions;
+    if (cursor) {
+      const internalId = decodeCursor(cursor);
 
-    if (useCursorPagination) {
-      // Cursor pagination: seek past the cursor row using (createdAt, id)
-      // compound key to avoid drift when new rows are inserted during paging.
       const cursorRow = await this.prisma.transaction.findUnique({
-        where: { id: cursor! },
+        where: { id: internalId },
         select: { createdAt: true, id: true },
       });
 
       if (cursorRow) {
         where.AND = [
-          ...(where.AND ? (Array.isArray(where.AND) ? where.AND : [where.AND]) : []),
+          ...(where.AND
+            ? Array.isArray(where.AND)
+              ? where.AND
+              : [where.AND]
+            : []),
           {
             OR: [
               { createdAt: { lt: cursorRow.createdAt } },
               {
-                createdAt: cursorRow.createdAt,
+                createdAt: { equals: cursorRow.createdAt },
                 id: { lt: cursorRow.id },
               },
             ],
@@ -104,63 +122,149 @@ export class TransactionsService {
       }
     }
 
-    const skip = useCursorPagination ? 0 : ((query as any).page - 1) * limit;
+    // ── Fetch limit+1 rows to detect the next page ──────────────────────────
 
-    const [total, transactions] = await Promise.all([
-      this.prisma.transaction.count({ where }),
-      this.prisma.transaction.findMany({
-        where,
-        select: {
-          id: true,
-          fromWalletId: true,
-          toWalletId: true,
-          amount: true,
-          assetCode: true,
-          stellarTxHash: true,
-          status: true,
-          createdAt: true,
-          updatedAt: true,
-        },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip,
-        take: limit + 1, // fetch one extra to detect next page
-      }),
-    ]);
+    const rows = await this.prisma.transaction.findMany({
+      where,
+      select: {
+        id: true,
+        fromWalletId: true,
+        toWalletId: true,
+        amount: true,
+        assetCode: true,
+        assetIssuer: true,
+        metadata: true,
+        feeAmount: true,
+        feeAssetCode: true,
+        stellarTxHash: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    });
 
-    const hasNextPage = transactions.length > limit;
-    const page = transactions.slice(0, limit);
-    const nextCursor = hasNextPage ? page[page.length - 1]?.id ?? null : null;
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    // Encode the cursor from the last row's internal id so the caller never
+    // sees the raw database id.
+    const nextCursor =
+      hasMore && page.length > 0
+        ? encodeCursor(page[page.length - 1]!.id)
+        : null;
 
     const data: TransactionDto[] = page.map((t) => ({
       id: t.id,
       fromWalletId: t.fromWalletId,
       toWalletId: t.toWalletId,
-      // Issue #409: return amount as string to preserve Decimal precision.
-      // Stellar uses 7-decimal stroops; floats risk rounding drift.
+      // Return amount as string to preserve Decimal(20,7) precision (#409).
       amount: t.amount.toString(),
       assetCode: t.assetCode,
+      assetIssuer: t.assetIssuer ?? null,
+      network: (t.metadata as { network?: WalletNetwork } | null)?.network,
+      feeAmount: t.feeAmount?.toString() ?? '0',
+      feeAssetCode: t.feeAssetCode,
       stellarTxHash: t.stellarTxHash ?? null,
       status: t.status,
       createdAt: t.createdAt,
       updatedAt: t.updatedAt,
     }));
 
-    const nextCursor = hasNextPage ? (page[page.length - 1]?.id ?? null) : null;
+    return { data, nextCursor, hasMore, limit };
+  }
 
-    return { data, nextCursor, hasNextPage, limit, total, page: (query as any).page ?? 1, limit, nextCursor, hasNextPage };
-   
+  /**
+   * Submit a new transaction.
+   *
+   * Two independent deduplication mechanisms are supported and either may be
+   * used (or both):
+   *
+   * - Issue #244 — `dto.stellarTxHash`. The column carries a unique index, so a
+   *   duplicate is resolved by a `P2002` catch as well as by the pre-check.
+   * - Issue #615 — the `Idempotency-Key` request header, passed here as
+   *   `idempotencyKey`. Must be a v4 UUID. The claim is made with a single
+   *   atomic `SET ... NX PX` (see `IdempotencyService`), so two concurrent
+   *   requests carrying the same key cannot both insert: one executes and
+   *   stores its response, the other replays that stored response without
+   *   re-executing — even if its payload differs.
+   */
+  async submitTransaction(
+    dto: SubmitTransactionDto,
+    idempotencyKey?: string,
+  ): Promise<SubmitTransactionResponseDto> {
+    if (idempotencyKey !== undefined && !isValidIdempotencyKey(idempotencyKey)) {
+      throw new BadRequestException(
+        'Idempotency-Key header must be a version 4 UUID',
+      );
+    }
+
+    if (!idempotencyKey) {
+      return this.persistTransaction(dto);
+    }
+
+    const claim = await this.idempotency.claim(idempotencyKey);
+
+    if (claim.status === 'replayed') {
+      return claim.response as SubmitTransactionResponseDto;
+    }
+
+    try {
+      const result = await this.persistTransaction(dto);
+      await this.idempotency.complete(idempotencyKey, result);
+      return result;
+    } catch (err) {
+      // Drop the claim so a corrected retry with the same key can succeed
+      // instead of being replayed as a 24-hour "in flight".
+      await this.idempotency.release(idempotencyKey);
+      throw err;
+    }
   }
 
   /**
    * Issue #244 — Idempotent transaction submission.
    */
-  async submitTransaction(
+  private async persistTransaction(
     dto: SubmitTransactionDto,
-  ): Promise<TransactionDto & { alreadyExisted: boolean }> {
+  ): Promise<SubmitTransactionResponseDto> {
     if (!dto.fromWalletId || !dto.toWalletId) {
       throw new BadRequestException(
         'Both fromWalletId and toWalletId are required',
       );
+    }
+
+    const network = dto.network ?? WalletNetwork.STELLAR;
+    const fee = NETWORK_FEES[network];
+    const assetCode = (dto.assetCode ?? fee.asset).toUpperCase();
+    const [fromWallet, toWallet] = await Promise.all([
+      this.prisma.wallet?.findUnique?.({ where: { id: dto.fromWalletId } }),
+      this.prisma.wallet?.findUnique?.({ where: { id: dto.toWalletId } }),
+    ]);
+
+    for (const wallet of [fromWallet, toWallet].filter(Boolean)) {
+      if (wallet.network !== network) {
+        throw new BadRequestException(
+          `Wallet ${wallet.id} does not belong to the ${network} network`,
+        );
+      }
+      if (!isValidNetworkAddress(wallet.depositAddress, network)) {
+        throw new BadRequestException(`Invalid ${network} wallet address`);
+      }
+    }
+
+    if (network === WalletNetwork.STELLAR) {
+      if (assetCode === 'XLM' && dto.assetIssuer) {
+        throw new BadRequestException('XLM must not have an asset issuer');
+      }
+      if (assetCode !== 'XLM' && (!dto.assetIssuer || !isValidNetworkIssuer(dto.assetIssuer, network))) {
+        throw new BadRequestException('A valid Stellar asset issuer is required for non-XLM assets');
+      }
+    } else {
+      const nativeAsset = fee.asset;
+      if (assetCode !== nativeAsset || dto.assetIssuer) {
+        throw new BadRequestException(`${network} transactions must use ${nativeAsset} without an asset issuer`);
+      }
     }
 
     // Idempotency check: if we already have a record with this hash, return it.
@@ -175,6 +279,10 @@ export class TransactionsService {
           toWalletId: existing.toWalletId,
           amount: existing.amount.toString(),
           assetCode: existing.assetCode,
+          assetIssuer: existing.assetIssuer ?? null,
+          network: (existing.metadata as { network?: WalletNetwork } | null)?.network,
+          feeAmount: existing.feeAmount?.toString() ?? '0',
+          feeAssetCode: existing.feeAssetCode,
           stellarTxHash: existing.stellarTxHash ?? null,
           status: existing.status,
           createdAt: existing.createdAt,
@@ -190,9 +298,13 @@ export class TransactionsService {
           fromWalletId: dto.fromWalletId,
           toWalletId: dto.toWalletId,
           amount: dto.amount,
-          assetCode: dto.assetCode ?? 'XLM',
+          assetCode,
+          assetIssuer: dto.assetIssuer ?? null,
+          feeAmount: fee.amount,
+          feeAssetCode: fee.asset,
           stellarTxHash: dto.stellarTxHash ?? null,
           status: 'PENDING',
+          metadata: { network },
         },
       });
 
@@ -202,6 +314,10 @@ export class TransactionsService {
         toWalletId: created.toWalletId,
         amount: created.amount.toString(),
         assetCode: created.assetCode,
+        assetIssuer: created.assetIssuer ?? null,
+        network,
+        feeAmount: created.feeAmount?.toString() ?? fee.amount,
+        feeAssetCode: created.feeAssetCode ?? fee.asset,
         stellarTxHash: created.stellarTxHash ?? null,
         status: created.status,
         createdAt: created.createdAt,
@@ -224,6 +340,10 @@ export class TransactionsService {
             toWalletId: existing.toWalletId,
             amount: existing.amount.toString(),
             assetCode: existing.assetCode,
+            assetIssuer: existing.assetIssuer ?? null,
+            network: (existing.metadata as { network?: WalletNetwork } | null)?.network,
+            feeAmount: existing.feeAmount?.toString() ?? '0',
+            feeAssetCode: existing.feeAssetCode,
             stellarTxHash: existing.stellarTxHash ?? null,
             status: existing.status,
             createdAt: existing.createdAt,
@@ -237,5 +357,42 @@ export class TransactionsService {
       }
       throw err;
     }
+  }
+
+  /**
+   * GET /transactions/fee-estimate
+   * Estimates network fee and approximate fiat equivalent for a transaction.
+   */
+  async estimateFee(dto: {
+    assetCode?: string;
+    amount?: string;
+    recipient?: string;
+    network?: WalletNetwork;
+  }) {
+    const network = dto.network ?? WalletNetwork.STELLAR;
+    const fee = NETWORK_FEES[network] ?? NETWORK_FEES[WalletNetwork.STELLAR];
+    const assetCode = (dto.assetCode ?? fee.asset).toUpperCase();
+
+    // Approximate fiat rate table (mock/reference rates for fee display)
+    const fiatRates: Record<string, number> = {
+      XLM: 0.12,
+      USDC: 1.0,
+      EURC: 1.08,
+      ETH: 2500.0,
+      BTC: 60000.0,
+    };
+
+    const feeAmountNum = parseFloat(fee.amount);
+    const rate = fiatRates[assetCode] ?? fiatRates[fee.asset] ?? 0.12;
+    const fiatVal = (feeAmountNum * rate).toFixed(4);
+
+    return {
+      feeAmount: fee.amount,
+      assetCode: fee.asset,
+      fiatAmount: fiatVal,
+      fiatCurrency: 'USD',
+      minimumNetworkFee: fee.amount,
+      feeType: 'standard',
+    };
   }
 }

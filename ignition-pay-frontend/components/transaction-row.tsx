@@ -11,21 +11,19 @@ import {
   RefreshCw,
   ExternalLink,
 } from 'lucide-react'
+import Link from 'next/link'
 import type { Transaction, OptimisticTransaction } from '@/features/history/models'
 import { isOptimisticTransaction } from '@/features/history/models'
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from '@/components/ui/sheet'
+// The row now navigates to a dedicated transaction detail page instead of opening an inline sheet.
 import { useTranslation } from '@/lib/i18n'
 
-interface TransactionRowProps {
-  transaction: Transaction | OptimisticTransaction
-}
+/**
+ * Box-model classes shared by a transaction row and its skeleton (#625).
+ *
+ * Exported so a test can assert the placeholder occupies the same space as the
+ * row it stands in for.
+ */
+export const TRANSACTION_ROW_SHELL = 'flex items-center justify-between py-4 px-4 rounded-lg'
 
 /**
  * Status badge component that handles both real and optimistic transactions.
@@ -40,7 +38,9 @@ function TransactionStatusBadge({
   const { t } = useTranslation()
   const isOptimistic = isOptimisticTransaction(transaction)
 
-  if (isOptimistic) {
+  // A confirmed optimistic entry falls through to the normal status badge, so
+  // the user sees Pending become Confirmed on the same row.
+  if (isOptimistic && transaction.status === 'pending') {
     return (
       <span
         className="text-xs px-2 py-1 rounded-full bg-yellow-500/20 text-yellow-500 inline-flex items-center gap-1 font-medium"
@@ -95,34 +95,44 @@ function TransactionStatusBadge({
 
 interface TransactionRowProps {
   transaction: Transaction | OptimisticTransaction
+  /**
+   * tabIndex for roving focus (issue #628). A list managed by
+   * {@link useRovingFocus} passes 0 for the active row and -1 for the others, so
+   * the whole list is one tab stop. Omitted, the row behaves as an ordinary link.
+   */
+  tabIndex?: number
 }
 
-export function TransactionRow({ transaction }: TransactionRowProps) {
+export function TransactionRow({ transaction, tabIndex }: TransactionRowProps) {
   const { t } = useTranslation()
   const { type, asset, amount, recipient, timestamp, status } = transaction
   const displayRecipient = recipient.slice(0, 6) + '...' + recipient.slice(-4)
   const isSent = type === 'sent'
 
-  const formattedDate = timestamp.toLocaleDateString('en-US', {
+  // Horizon reports ledger close times in UTC, so name the timezone the row is
+  // shown in and expose the exact UTC instant for comparison.
+  const formattedDate = timestamp.toLocaleString('en-US', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZoneName: 'short',
   })
+  const utcTimestamp = Number.isNaN(timestamp.getTime()) ? undefined : timestamp.toISOString()
 
   const isOptimistic = isOptimisticTransaction(transaction)
-
-  // Determine standard fee
-  const networkFee = '0.00001 XLM'
-  const explorerLink = transaction.txHash
-    ? `https://stellar.expert/explorer/public/tx/${transaction.txHash}`
-    : '#'
+  const txId = isOptimistic ? transaction.optimisticId : transaction.id
 
   return (
-    <Sheet>
-      <SheetTrigger asChild>
-    <div
-      className={`flex items-center justify-between py-4 px-4 rounded-lg transition-colors border ${
+    <Link
+      href={isOptimistic ? '#' : `/transactions/${txId}`}
+      data-roving-item=""
+      tabIndex={tabIndex}
+      className={`${TRANSACTION_ROW_SHELL} transition-colors border ${
+        // A roving list is only usable if you can see where you are, and the row
+        // had no focus styling at all.
+        'outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background '
+      }${
         isOptimistic
           ? 'bg-yellow-500/5 border-yellow-500/30 hover:bg-yellow-500/10'
           : 'border-transparent hover:bg-muted/50 hover:border-border'
@@ -153,77 +163,56 @@ export function TransactionRow({ transaction }: TransactionRowProps) {
           {isSent ? '-' : '+'}
           {amount.toFixed(4)} {asset}
         </p>
-        <p className="text-xs text-muted-foreground">{formattedDate}</p>
+        <time
+          className="text-xs text-muted-foreground"
+          dateTime={utcTimestamp}
+          title={utcTimestamp ? `${utcTimestamp} (UTC)` : undefined}
+        >
+          {formattedDate}
+        </time>
         <TransactionStatusBadge transaction={transaction} />
       </div>
-    </div>
-      </SheetTrigger>
-      
-      <SheetContent side="right">
-        <SheetHeader>
-          <SheetTitle>{t('transactionRow.details')}</SheetTitle>
-          <SheetDescription>
-            {t('transactionRow.detailsDesc')}
-          </SheetDescription>
-        </SheetHeader>
-        
-        <div className="mt-6 space-y-6">
-          {/* Status */}
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">{t('transactionRow.status')}</span>
-            <TransactionStatusBadge transaction={transaction} />
-          </div>
+    </Link>
+  )
+}
 
-          {/* Amount */}
-          <div className="flex flex-col gap-1">
-            <span className="text-sm text-muted-foreground">{t('transactionRow.amount')}</span>
-            <p className={`text-xl font-bold ${isSent ? 'text-red-500' : 'text-green-500'}`}>
-              {isSent ? '-' : '+'}{amount.toFixed(4)} {asset}
-            </p>
-          </div>
+/**
+ * Loading placeholder for {@link TransactionRow} (#625).
+ *
+ * Mirrors the row's box model exactly — `py-4 px-4`, the `w-12 h-12` avatar, the
+ * two-line left column and the three-line right column — so a list of skeletons
+ * occupies the same height as the list that replaces it.
+ *
+ * @param props - `count` is how many placeholder rows to draw.
+ * @returns A non-interactive list of placeholder rows.
+ */
+export function TransactionRowSkeleton({ count = 3 }: { count?: number }) {
+  return (
+    <div role="status" aria-live="polite">
+      <span className="sr-only">Loading transactions</span>
 
-          {/* Timestamp */}
-          <div className="flex flex-col gap-1">
-            <span className="text-sm text-muted-foreground">{t('transactionRow.dateTime')}</span>
-            <p className="text-sm text-foreground">{formattedDate}</p>
-          </div>
-
-          {/* Fee */}
-          <div className="flex flex-col gap-1">
-            <span className="text-sm text-muted-foreground">{t('transactionRow.networkFee')}</span>
-            <p className="text-sm text-foreground">{networkFee}</p>
-          </div>
-
-          {/* Recipient */}
-          <div className="flex flex-col gap-1">
-            <span className="text-sm text-muted-foreground">{isSent ? t('transactionRow.to') : t('transactionRow.from')}</span>
-            <p className="text-sm font-mono break-all bg-muted/30 p-2 rounded-md">
-              {recipient}
-            </p>
-          </div>
-
-          {/* Hash & Explorer Link */}
-          {!isOptimistic && transaction.txHash && (
-            <div className="flex flex-col gap-1 pt-4 border-t border-border">
-              <span className="text-sm text-muted-foreground">Transaction Hash</span>
-              <div className="flex items-center justify-between gap-2 mt-1">
-                <p className="text-xs font-mono break-all flex-1">
-                  {transaction.txHash}
-                </p>
-                <a
-                  href={explorerLink}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="p-2 hover:bg-muted rounded-md transition-colors text-primary flex-shrink-0"
-                  title="View on Stellar Expert"
-                >
-                  <ExternalLink size={16} />
-                </a>
+      <div className="divide-y divide-border" aria-hidden="true">
+        {Array.from({ length: count }, (_, index) => (
+          <div
+            key={index}
+            className={`${TRANSACTION_ROW_SHELL} border border-transparent animate-pulse`}
+          >
+            <div className="flex items-center gap-4 flex-1">
+              <div className="w-12 h-12 rounded-full bg-muted" />
+              <div className="flex-1 min-w-0 space-y-2">
+                <div className="h-6 w-32 rounded bg-muted" />
+                <div className="h-5 w-40 rounded bg-muted" />
               </div>
             </div>
-          )}
-        </div>
-      </SheetContent>
-    </Sheet>
+
+            <div className="flex flex-col items-end gap-1">
+              <div className="h-6 w-28 rounded bg-muted" />
+              <div className="h-4 w-20 rounded bg-muted" />
+              <div className="h-6 w-20 rounded-full bg-muted" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }

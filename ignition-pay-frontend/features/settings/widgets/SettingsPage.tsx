@@ -2,7 +2,6 @@
 
 import { useState } from 'react'
 import {
-  Bell,
   Lock,
   User,
   Eye,
@@ -26,8 +25,11 @@ import { updateProfile } from '../services'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { useTheme } from '@/hooks/use-theme'
 import { ApiKeysSection } from './ApiKeysSection'
+import { NotificationSettings } from './NotificationSettings'
+import { KeyboardShortcutSettings } from './KeyboardShortcutSettings'
 
 import { useTranslation, type SupportedLocale } from '@/lib/i18n'
+import { clearExperimentState } from '@/lib/ab-testing'
 
 export function SettingsPage() {
   const { t, locale, setLocale } = useTranslation()
@@ -35,12 +37,6 @@ export function SettingsPage() {
   const [copied, setCopied] = useState(false)
   const [displayName, setDisplayName] = useState('')
   const [avatarUrl, setAvatarUrl] = useState('')
-  const [notifications, setNotifications] = useState({
-    payments: true,
-    anchors: true,
-    security: true,
-    news: false,
-  })
   const { consented, setConsented } = useAnalyticsConsent()
   const { mode, setMode } = useTheme()
   const [sessions] = useState([
@@ -58,11 +54,19 @@ export function SettingsPage() {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  // #883 — A/B assignments and the anonymous experiment id must not survive a
+  // sign-out, otherwise the next account on this browser inherits the previous
+  // account's experiments. The real auth teardown belongs here too, once the
+  // session flow lands.
+  const handleSignOut = () => {
+    clearExperimentState()
+  }
+
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
       <div className="border-b border-border bg-card/50 backdrop-blur-sm">
-        <div className="px-6 py-8 max-w-4xl mx-auto">
+        <div className="px-6 py-8 max-w-7xl mx-auto">
           <div className="flex items-center justify-between mb-6">
             <div>
               <h1 className="text-3xl font-bold text-foreground">{t('settings.title')}</h1>
@@ -77,8 +81,65 @@ export function SettingsPage() {
         </div>
       </div>
 
-      {/* Main Content */}
-      <div className="max-w-4xl mx-auto px-6 py-8 space-y-8">
+      {/* Main Content - Responsive Layout */}
+      <div className="max-w-7xl mx-auto px-6 py-8">
+        <div className="flex flex-col lg:flex-row gap-8">
+          {/* Sidebar Navigation - Collapses to horizontal tabs on tablet */}
+          <aside className="lg:w-64 flex-shrink-0">
+            <nav className="lg:sticky lg:top-8">
+              {/* Desktop: Vertical sidebar */}
+              <div className="hidden lg:block space-y-1">
+                <button className="w-full text-left px-4 py-2 rounded-lg bg-primary text-primary-foreground font-medium">
+                  Account
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  Security
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  Sessions
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  API Keys
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  Notifications
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  Privacy
+                </button>
+                <button className="w-full text-left px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+                  Preferences
+                </button>
+              </div>
+              {/* Tablet/Mobile: Horizontal tabs */}
+              <div className="lg:hidden flex overflow-x-auto gap-2 pb-2 -mx-6 px-6 scrollbar-hide">
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg bg-primary text-primary-foreground font-medium whitespace-nowrap">
+                  Account
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  Security
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  Sessions
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  API Keys
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  Notifications
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  Privacy
+                </button>
+                <button className="flex-shrink-0 px-4 py-2 rounded-lg hover:bg-muted text-muted-foreground transition-colors whitespace-nowrap">
+                  Preferences
+                </button>
+              </div>
+            </nav>
+          </aside>
+
+          {/* Content Area - Takes full width on mobile/tablet */}
+          <div className="flex-1 min-w-0 space-y-8">
         {/* Account Section */}
         <div className="bg-card rounded-xl border border-border p-8 space-y-6">
           <div className="flex items-center gap-3 mb-6">
@@ -128,7 +189,7 @@ export function SettingsPage() {
                   GBKXNRTZQVD6CNOQNRZVMJVQ4ZQ5K...
                 </p>
               </div>
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" data-testid="settings-copy-address-button">
                 <Copy size={16} className="mr-2" />
                 Copy
               </Button>
@@ -167,7 +228,7 @@ export function SettingsPage() {
                 <p className="font-semibold text-foreground">Password</p>
                 <p className="text-sm text-muted-foreground">Last changed 2 months ago</p>
               </div>
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" data-testid="settings-change-password-button">
                 Change Password
               </Button>
             </div>
@@ -225,7 +286,7 @@ export function SettingsPage() {
                     ))}
                   </div>
 
-                  <Button variant="outline" className="w-full" onClick={copySeed}>
+                  <Button variant="outline" className="w-full" onClick={copySeed} data-testid="settings-copy-seed-button">
                     <Copy className="mr-2 h-4 w-4" />
                     {copied ? 'Copied!' : 'Copy Phrase'}
                   </Button>
@@ -277,65 +338,10 @@ export function SettingsPage() {
         <ApiKeysSection />
 
         {/* Notifications Section */}
-        <div className="bg-card rounded-xl border border-border p-8 space-y-6">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center">
-              <Bell size={20} className="text-blue-500" />
-            </div>
-            <h2 className="text-xl font-bold text-foreground">Notifications</h2>
-          </div>
+        <NotificationSettings />
 
-          <div className="space-y-4">
-            {Object.entries(notifications).map(([key, value]) => (
-              <div
-                key={key}
-                className="flex items-center justify-between py-4 border-b border-border last:border-b-0"
-              >
-                <div>
-                  <p className="font-semibold text-foreground capitalize">
-                    {key === 'payments'
-                      ? 'Payment Alerts'
-                      : key === 'anchors'
-                        ? 'Anchor Updates'
-                        : key === 'security'
-                          ? 'Security Alerts'
-                          : 'News & Updates'}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {key === 'payments'
-                      ? 'Notify when you send or receive payments'
-                      : key === 'anchors'
-                        ? 'Notify when anchors go online/offline'
-                        : key === 'security'
-                          ? 'Notify about suspicious activity'
-                          : 'Notify about Ignition Pay updates'}
-                  </p>
-                </div>
-
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={value}
-                    onChange={() => {
-                      const next = { ...notifications, [key]: !value }
-                      setNotifications(next)
-                      save({
-                        ...preferences,
-                        notifications: {
-                          email: next.payments,
-                          push: next.security,
-                          sms: next.anchors,
-                        },
-                      })
-                    }}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-muted peer-checked:bg-primary rounded-full peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" />
-                </label>
-              </div>
-            ))}
-          </div>
-        </div>
+        {/* Keyboard Shortcuts Section */}
+        <KeyboardShortcutSettings />
 
         {/* Privacy Section */}
         <div className="bg-card rounded-xl border border-border p-8 space-y-6">
@@ -365,7 +371,7 @@ export function SettingsPage() {
                   onChange={() => setConsented(!consented)}
                   className="sr-only peer"
                 />
-                <div className="w-11 h-6 bg-muted peer-checked:bg-primary rounded-full peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" />
+                <div className="w-11 h-6 bg-muted peer-checked:bg-primary rounded-full peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" />
               </label>
             </div>
           </div>
@@ -449,7 +455,12 @@ export function SettingsPage() {
           <h2 className="text-xl font-bold text-red-500">Danger Zone</h2>
 
           <div className="space-y-3">
-            <Button variant="outline" className="w-full justify-start">
+            <Button
+              variant="outline"
+              className="w-full justify-start"
+              data-testid="settings-signout-button"
+              onClick={handleSignOut}
+            >
               <LogOut className="mr-2 h-4 w-4" />
               Sign Out
             </Button>
@@ -463,6 +474,8 @@ export function SettingsPage() {
             <p className="text-sm text-muted-foreground">
               Signing out will remove your session. Your account will remain secure.
             </p>
+          </div>
+        </div>
           </div>
         </div>
       </div>

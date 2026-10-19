@@ -1,29 +1,51 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter/scheduler.dart';
 
 import 'app.dart';
-import 'core/monitoring_service.dart';
-import 'core/network/api_client.dart';
-import 'core/push_notification_service.dart';
+import 'core/bootstrap/app_bootstrap.dart';
+import 'core/bootstrap/splash_app.dart';
 
+/// App entry point.
+///
+/// Before #684 this function awaited `.env`, Firebase, Sentry, analytics and a
+/// deep-link round trip *before* calling `runApp`, so none of that could
+/// overlap with the first frame. Now the splash is painted first, only the
+/// critical path is awaited, and everything else is deferred:
+///
+/// 1. `runApp(SplashApp())` — first frame, no plugin or asset work.
+/// 2. `runCriticalPath()` — `.env` (parsed in a background isolate) and the API
+///    client.
+/// 3. `runRouteRestoration()` — the last visited route (#698), one
+///    SharedPreferences read, so the app opens on the restored screen instead
+///    of flashing home first.
+/// 4. `runApp(IgnitionPayApp())` — the restored screen renders.
+/// 5. `runDeferred()` — Firebase, push notifications, offline draft sync and
+///    deep links, unawaited. Deep links replace the restored route, which is
+///    what "deep links always take priority" means in practice.
+/// 6. First post-frame callback — Sentry/Crashlytics and the analytics flush.
+///
+/// Phase timings are logged as `[startup] <phase> done at <n>ms`; see
+/// `docs/STARTUP_PERFORMANCE.md`.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Load environment variables from .env (API_BASE_URL, SENTRY_DSN, …)
-  await dotenv.load(fileName: '.env');
+  final bootstrap = AppBootstrap.production(log: defaultStartupLog);
 
-  // Initialise crash reporting (Firebase Crashlytics + Sentry).
-  // [MonitoringService.init] also handles Firebase.initializeApp() and sets
-  // up the Flutter / PlatformDispatcher error handlers before runApp is called.
-  //
-  // The [runApp] callback is invoked by SentryFlutter.init so that Sentry
-  // can wrap the widget tree inside its own error-capture zone.
-  await MonitoringService.init(
-    runApp: () async {
-      // Services that depend on Firebase being ready go here.
-      ApiClient().initialize();
-      await PushNotificationService().init();
-      runApp(const IgnitionPayApp());
-    },
+  runApp(const SplashApp());
+
+  await bootstrap.runCriticalPath();
+
+  // Must run before `IgnitionPayApp` builds the router: the restored route
+  // becomes the router's `initialLocation` (#698).
+  await bootstrap.runRouteRestoration();
+
+  runApp(const IgnitionPayApp());
+
+  unawaited(bootstrap.runDeferred());
+
+  SchedulerBinding.instance.addPostFrameCallback(
+    (_) => unawaited(bootstrap.runAfterFirstFrame()),
   );
 }

@@ -78,9 +78,21 @@ export function AssetAmountPicker({
             type="text"
             inputMode="decimal"
             placeholder="0.00"
-            className={`h-auto px-4 py-3 ${showError ? 'border-destructive' : ''}`}
+            className={`h-auto px-4 py-3 text-[16px] ${showError ? 'border-destructive' : ''}`}
             value={amount}
-            onChange={(event) => onAmountChange(event.target.value)}
+            onChange={(event) => {
+              const val = event.target.value
+              if (val === "") {
+                onAmountChange(val)
+                return
+              }
+              // Keep over-precision input visible so validateAmount can show
+              // the user why it cannot be sent instead of silently dropping it.
+              const regex = /^\d*\.?\d*$/
+              if (regex.test(val)) {
+                onAmountChange(val)
+              }
+            }}
             aria-invalid={showError}
             aria-describedby="amount-feedback"
             required
@@ -102,3 +114,4 @@ export function AssetAmountPicker({
     </div>
   )
 }
+

@@ -2,20 +2,14 @@
 extern crate std;
 
 use crate::{
-    IgnitionPayContract, IgnitionPayContractClient,
+    DelegationContract, DelegationContractClient, GovernanceContract, GovernanceContractClient,
+    IgnitionPayContract, IgnitionPayContractClient, MultiOracleContract, MultiOracleContractClient,
+    QuoteLockContract, QuoteLockContractClient, TokenMetadataContract, TokenMetadataContractClient,
     WrappedAssetBridgeContract, WrappedAssetBridgeContractClient,
-    TokenMetadataContract, TokenMetadataContractClient,
-    GovernanceContract, GovernanceContractClient,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
-    Address, Env, Symbol,
-    DelegationContract, DelegationContractClient, IgnitionPayContract, IgnitionPayContractClient,
-    MultiOracleContract, MultiOracleContractClient, QuoteLockContract, QuoteLockContractClient,
-};
-use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
-    Address, Env, Symbol, Vec,
+    Address, Env, String, Symbol, Vec,
 };
 
 fn create_contract(env: &Env) -> IgnitionPayContractClient {
@@ -384,7 +378,7 @@ fn test_governance_create_proposal() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title = Symbol::new(&env, "Proposal 1");
+    let title = String::from_str(&env, "Proposal 1");
     contract.create_proposal(&author, &title, &1000);
 
     assert_eq!(contract.get_proposal_count(), 1);
@@ -406,8 +400,8 @@ fn test_governance_proposal_count_increments() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title1 = Symbol::new(&env, "Proposal 1");
-    let title2 = Symbol::new(&env, "Proposal 2");
+    let title1 = String::from_str(&env, "Proposal 1");
+    let title2 = String::from_str(&env, "Proposal 2");
     contract.create_proposal(&author, &title1, &1000);
     contract.create_proposal(&author, &title2, &2000);
 
@@ -438,7 +432,7 @@ fn test_governance_execute_before_end() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title = Symbol::new(&env, "Proposal 1");
+    let title = String::from_str(&env, "Proposal 1");
     contract.create_proposal(&author, &title, &1000);
     contract.execute_proposal(&1);
 }
@@ -455,7 +449,7 @@ fn test_governance_double_execute() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title = Symbol::new(&env, "Proposal 1");
+    let title = String::from_str(&env, "Proposal 1");
     contract.create_proposal(&author, &title, &1000);
 
     // Fast forward past voting period
@@ -479,7 +473,7 @@ fn test_governance_get_vote_tally_initial() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title = Symbol::new(&env, "Proposal 1");
+    let title = String::from_str(&env, "Proposal 1");
     contract.create_proposal(&author, &title, &1000);
 
     let (for_votes, against_votes) = contract.get_vote_tally(&1);
@@ -499,7 +493,7 @@ fn test_governance_has_voted_initial() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
 
-    let title = Symbol::new(&env, "Proposal 1");
+    let title = String::from_str(&env, "Proposal 1");
     contract.create_proposal(&author, &title, &1000);
 
     assert_eq!(contract.has_voted(&1, &voter), false);
@@ -516,6 +510,71 @@ fn test_governance_set_quorum_invalid() {
     contract.initialize(&admin, &token);
     env.mock_all_auths();
     contract.set_quorum(&10001);
+// --- PriceFeedContract Tests ---
+
+fn create_price_feed_contract(env: &Env) -> crate::PriceFeedContractClient {
+    crate::PriceFeedContractClient::new(env, &env.register_contract(None, crate::PriceFeedContract))
+}
+
+fn create_multi_oracle_contract(env: &Env) -> MultiOracleContractClient {
+    MultiOracleContractClient::new(env, &env.register_contract(None, MultiOracleContract))
+}
+
+/// Issue #851 — [CONTRACT-039]
+///
+/// `PriceFeedContract::get_max_staleness` must proxy through to the backing
+/// `MultiOracleContract` so that registered providers can determine how fresh
+/// their data must be before calling `update_price`.
+///
+/// Sub-tests:
+/// 1. Default: returns `DEFAULT_MAX_STALENESS_SECONDS` (300) before any
+///    `set_max_staleness` call.
+/// 2. Custom: returns whatever value the oracle admin has configured.
+/// 3. Zero: the getter faithfully relays a staleness of 0 (reject all prices
+///    scenario that the admin explicitly configured).
+#[test]
+fn test_price_feed_get_max_staleness_returns_oracle_value() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let oracle_admin = Address::random(&env);
+    let feed_admin = Address::random(&env);
+    let oracle = Address::random(&env);
+
+    // Deploy both contracts.
+    let oracle_contract = create_multi_oracle_contract(&env);
+    let feed_contract = create_price_feed_contract(&env);
+
+    oracle_contract.initialize(&oracle_admin, &Vec::from_array(&env, [oracle.clone()]));
+    feed_contract.initialize(&feed_admin);
+
+    let oracle_addr = oracle_contract.address.clone();
+
+    // 1. Default staleness (300 s) — admin has never called set_max_staleness.
+    assert_eq!(
+        feed_contract.get_max_staleness(&oracle_addr),
+        300,
+        "default max_staleness must be 300 seconds"
+    );
+
+    // 2. After the oracle admin updates max_staleness, the feed getter must
+    //    reflect the new value immediately.
+    oracle_contract.set_max_staleness(&600);
+    assert_eq!(
+        feed_contract.get_max_staleness(&oracle_addr),
+        600,
+        "get_max_staleness must mirror the oracle's configured value (600 s)"
+    );
+
+    // 3. Edge case: staleness set to 0 (all prices rejected by the oracle).
+    oracle_contract.set_max_staleness(&0);
+    assert_eq!(
+        feed_contract.get_max_staleness(&oracle_addr),
+        0,
+        "get_max_staleness must faithfully return 0 when configured"
+    );
+}
+
 #[test]
 #[should_panic(expected = "All prices are stale")]
 fn test_oracle_rejects_stale_prices() {
@@ -597,4 +656,195 @@ fn test_quote_lock_is_one_time_and_preserves_terms() {
     assert_eq!(executed.sell_amount, 100);
     assert_eq!(executed.buy_amount, 250);
     assert_eq!(contract.get_quote(&id).executed, true);
+}
+
+// --- PaymentContract batch_send payout_sent event tests ---
+
+mod mock_token {
+    use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+
+    #[contract]
+    pub struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    }
+}
+
+#[test]
+fn test_batch_send_emits_payout_sent_per_recipient() {
+    use crate::PaymentContract;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{vec, IntoVal, Vec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Register a minimal mock token that accepts transfer calls.
+    let token_id = env.register_contract(None, mock_token::MockToken);
+
+    let admin = Address::random(&env);
+    let sender = Address::random(&env);
+    let recipient_a = Address::random(&env);
+    let recipient_b = Address::random(&env);
+    let recipient_c = Address::random(&env);
+
+    // Deploy and initialise the PaymentContract.
+    let payment_id = env.register_contract(None, PaymentContract);
+    let payment_client = crate::PaymentContractClient::new(&env, &payment_id);
+    payment_client.initialize(&admin, &token_id);
+
+    // Build inputs: 3 recipients with distinct amounts.
+    let recipients: Vec<Address> = vec![
+        &env,
+        recipient_a.clone(),
+        recipient_b.clone(),
+        recipient_c.clone(),
+    ];
+    let amounts: Vec<i128> = vec![&env, 100_i128, 200_i128, 300_i128];
+
+    payment_client.batch_send(&sender, &recipients, &amounts);
+
+    // Collect all events emitted during this invocation.
+    let all_events = env.events().all();
+
+    // Separate payout_sent events from the batch_payment_sent summary.
+    let payout_topic = Symbol::new(&env, "payout_sent");
+    let batch_topic = Symbol::new(&env, "batch_payment_sent");
+
+    let payout_events: soroban_sdk::Vec<_> = all_events
+        .iter()
+        .filter(|(_, topics, _)| {
+            // topics is a Val-encoded tuple; compare the first element.
+            let topics_vec: soroban_sdk::Vec<soroban_sdk::Val> =
+                soroban_sdk::Vec::from_val(&env, topics);
+            if topics_vec.is_empty() {
+                return false;
+            }
+            let first: Symbol = topics_vec.get(0).unwrap().try_into_val(&env).unwrap_or_else(|_| Symbol::new(&env, ""));
+            first == payout_topic
+        })
+        .collect();
+
+    let batch_events: soroban_sdk::Vec<_> = all_events
+        .iter()
+        .filter(|(_, topics, _)| {
+            let topics_vec: soroban_sdk::Vec<soroban_sdk::Val> =
+                soroban_sdk::Vec::from_val(&env, topics);
+            if topics_vec.is_empty() {
+                return false;
+            }
+            let first: Symbol = topics_vec.get(0).unwrap().try_into_val(&env).unwrap_or_else(|_| Symbol::new(&env, ""));
+            first == batch_topic
+        })
+        .collect();
+
+    // Exactly 3 payout_sent events — one per recipient.
+    assert_eq!(payout_events.len(), 3, "expected exactly 3 payout_sent events");
+
+    // Verify each payout_sent carries the correct (recipient, amount) payload.
+    let expected: [(Address, i128); 3] = [
+        (recipient_a.clone(), 100_i128),
+        (recipient_b.clone(), 200_i128),
+        (recipient_c.clone(), 300_i128),
+    ];
+    for (i, (exp_recipient, exp_amount)) in expected.iter().enumerate() {
+        let (_, _, data) = &payout_events.get(i as u32).unwrap();
+        let (got_recipient, got_amount): (Address, i128) =
+            data.try_into_val(&env).expect("payout_sent data must be (Address, i128)");
+        assert_eq!(&got_recipient, exp_recipient, "payout_sent[{}] recipient mismatch", i);
+        assert_eq!(got_amount, *exp_amount, "payout_sent[{}] amount mismatch", i);
+    }
+
+    // The original batch_payment_sent summary event must still be present exactly once.
+    assert_eq!(batch_events.len(), 1, "expected exactly 1 batch_payment_sent summary event");
+}
+
+#[test]
+#[should_panic(expected = "Cannot delegate to self")]
+fn test_delegation_rejects_self_delegation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::random(&env);
+    let voter = Address::random(&env);
+    let contract = DelegationContractClient::new(
+        &env,
+        &env.register_contract(None, DelegationContract),
+    );
+
+    contract.initialize(&admin);
+    contract.delegate(&voter, &voter);
+}
+
+#[test]
+fn test_governance_accepts_long_human_readable_title() {
+    let env = Env::default();
+    let admin = Address::random(&env);
+    let token = Address::random(&env);
+    let author = Address::random(&env);
+    let contract = create_governance_contract(&env);
+
+    contract.initialize(&admin, &token);
+    env.mock_all_auths();
+
+    let title = String::from_str(&env, "Fund Q4 infrastructure reserve multisig");
+    contract.create_proposal(&author, &title, &1000);
+    assert_eq!(contract.get_proposal(&1).title, title);
+}
+
+#[test]
+#[should_panic(expected = "Proposal title exceeds 256 bytes")]
+fn test_governance_rejects_oversized_title() {
+    let env = Env::default();
+    let admin = Address::random(&env);
+    let token = Address::random(&env);
+    let author = Address::random(&env);
+    let contract = create_governance_contract(&env);
+
+    contract.initialize(&admin, &token);
+    env.mock_all_auths();
+
+    let title = String::from_str(&env, &"a".repeat(257));
+    contract.create_proposal(&author, &title, &1000);
+}
+
+#[test]
+#[should_panic(expected = "Proposal title cannot be empty")]
+fn test_governance_rejects_empty_title() {
+    let env = Env::default();
+    let admin = Address::random(&env);
+    let token = Address::random(&env);
+    let author = Address::random(&env);
+    let contract = create_governance_contract(&env);
+
+    contract.initialize(&admin, &token);
+    env.mock_all_auths();
+
+    contract.create_proposal(&author, &String::from_str(&env, ""), &1000);
+}
+
+#[test]
+fn test_price_feed_max_deviation_defaults_and_is_configurable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let feed_admin = Address::random(&env);
+    let feed_contract = create_price_feed_contract(&env);
+    feed_contract.initialize(&feed_admin);
+
+    assert_eq!(feed_contract.get_max_deviation_bps(), 5_000);
+    feed_contract.set_max_deviation_bps(&1_000);
+    assert_eq!(feed_contract.get_max_deviation_bps(), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Deviation must be between 1 and 10000 bps")]
+fn test_price_feed_rejects_zero_max_deviation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let feed_admin = Address::random(&env);
+    let feed_contract = create_price_feed_contract(&env);
+    feed_contract.initialize(&feed_admin);
+
+    feed_contract.set_max_deviation_bps(&0);
 }

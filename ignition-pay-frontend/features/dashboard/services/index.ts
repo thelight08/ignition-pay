@@ -9,6 +9,7 @@ import {
   type ErrorCodeType,
 } from '@/lib/constants'
 import type { AssetBalance, WalletSnapshot } from '@/features/dashboard/models'
+import { updateRateLimitFromHeaders } from '@/hooks/use-rate-limit'
 
 /** How often we re-poll `/wallets` when no realtime stream is available. */
 export const BALANCE_POLL_INTERVAL_MS = 15_000
@@ -98,6 +99,7 @@ export async function fetchWalletSnapshot(
       signal: composed,
       headers: { Accept: 'application/json' },
     })
+    updateRateLimitFromHeaders(response.headers)
   } catch (error) {
     if (signal?.aborted) throw error
     throw new DashboardError(ErrorCode.GEN_NETWORK_ERROR)
@@ -118,6 +120,22 @@ export function isLiveDataConfigured(): boolean {
 }
 
 export const DEMO_WALLET_ADDRESS = 'GBKXNRTZQVD6CNOQNRZVMJVQ4ZQ5K2NQXJ6K4VJKTQVJVQVJVQVJVQ'
+
+/**
+ * Resolves the active wallet address from prop, session storage, or demo address.
+ */
+export function resolveWalletAddress(providedAddress?: string): string {
+  if (providedAddress && providedAddress.trim().length > 0) {
+    return providedAddress.trim()
+  }
+  if (typeof window !== 'undefined') {
+    const stored = sessionStorage.getItem('ignition:wallet:address')
+    if (stored && stored.trim().length > 0) {
+      return stored.trim()
+    }
+  }
+  return DEMO_WALLET_ADDRESS
+}
 
 /** Stand-in snapshot used until the wallet API is wired to the dashboard. */
 export function demoWalletSnapshot(): WalletSnapshot {
@@ -167,23 +185,53 @@ export function subscribeToWalletStream(
   address: string,
   handlers: WalletStreamHandlers,
 ): (() => void) | null {
-  const streamUrl = process.env.NEXT_PUBLIC_WALLET_STREAM_URL
-  if (!streamUrl || typeof EventSource === 'undefined') return null
+  if (typeof EventSource === 'undefined') return null
 
-  const source = new EventSource(`${streamUrl}?address=${encodeURIComponent(address)}`)
+  const backendUrl = process.env.NEXT_PUBLIC_WALLET_STREAM_URL
+  const horizonUrl = process.env.NEXT_PUBLIC_HORIZON_URL
+
+  // Prefer the backend notification stream. Without one, fall back to
+  // Horizon's own payments stream for the account (server-sent events), so an
+  // incoming payment still refreshes balances immediately instead of waiting
+  // for the next poll.
+  let streamUrl: string | null = null
+  if (backendUrl) {
+    streamUrl = `${backendUrl}?address=${encodeURIComponent(address)}`
+  } else if (horizonUrl && /^G[A-Z2-7]{55}$/.test(address)) {
+    streamUrl = `${horizonUrl.replace(/\/$/, '')}/accounts/${address}/payments?cursor=now`
+  }
+  if (!streamUrl) return null
+
+  const source = new EventSource(streamUrl)
 
   const handleMessage = () => handlers.onBalanceChange()
   const handleError = () => handlers.onError?.()
 
   source.addEventListener('balance', handleMessage)
   source.addEventListener('payment', handleMessage)
+  // Horizon sends unnamed `message` events for each new payment operation.
+  source.addEventListener('message', handleMessage)
   source.addEventListener('error', handleError)
 
   return () => {
     source.removeEventListener('balance', handleMessage)
     source.removeEventListener('payment', handleMessage)
+    source.removeEventListener('message', handleMessage)
     source.removeEventListener('error', handleError)
     source.close()
+  }
+}
+
+/** Window event that asks every mounted `useWalletBalances` to reload now. */
+export const WALLET_BALANCES_INVALIDATED_EVENT = 'walletBalancesInvalidated'
+
+/**
+ * Invalidate cached dashboard balances. Call after any flow that is known to
+ * change the balance (e.g. a completed receive via QR scan or deep link).
+ */
+export function invalidateWalletBalances(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(WALLET_BALANCES_INVALIDATED_EVENT))
   }
 }
 
@@ -205,11 +253,11 @@ export async function fetchStellarDexPrices(
         : `counter_asset_type=${assetCode.length <= 4 ? 'credit_alphanum4' : 'credit_alphanum12'}&counter_asset_code=${assetCode}&counter_asset_issuer=${assetIssuer}`
 
     const url = `${horizonUrl}/trade_aggregations?${baseParam}&${counterParam}&resolution=86400000&limit=7&order=desc`
-
     const response = await fetch(url, {
       signal,
       headers: { Accept: 'application/json' },
     })
+    updateRateLimitFromHeaders(response.headers)
 
     if (response.ok) {
       const data = await response.json()
@@ -338,6 +386,7 @@ export async function fetchQuickStats(
       signal: composed,
       headers: { Accept: 'application/json' },
     })
+    updateRateLimitFromHeaders(response.headers)
 
     if (response.ok) {
       const data = await response.json()

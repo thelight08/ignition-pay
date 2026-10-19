@@ -1,11 +1,13 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { Send, Zap, AlertCircle, CheckCircle2, CheckCircle, Loader2 } from 'lucide-react'
+import { Send, Zap, AlertCircle, CheckCircle2, Loader2, WifiOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import Link from 'next/link'
 import { validateStellarAddress } from '@/lib/stellar/strkey'
+import { parsePaymentRequest } from '@/lib/stellar/paymentRequest'
+import { TransactionQueueList } from '@/components/transaction-queue-list'
 import {
   MEMO_TEXT_MAX_BYTES,
   MEMO_TYPES,
@@ -16,11 +18,18 @@ import {
   type MemoType,
 } from '@/lib/stellar/memo'
 import { AssetAmountPicker } from '@/components/asset-amount-picker'
-import { validateAmount, type SendableAsset } from '@/features/send/models'
-import { checkTrustline, type TrustlineCheck } from '@/features/send/services'
+import { EmptyState } from '@/components/empty-state'
+import { validateAmount, type SendableAsset, type NetworkFeeEstimate } from '@/features/send/models'
+import { checkTrustline, estimateTransactionFee, type TrustlineCheck } from '@/features/send/services'
 import { useOptimisticTransactions } from '@/features/history/state'
 import { useToast } from '@/components/ui/toast'
 import { API_BASE_URLS, API_PREFIX } from '@/lib/constants/api'
+import { useWalletBalances } from '@/features/dashboard/state'
+import { useContacts, useRecentRecipients } from '@/features/send/state/recipients'
+import { RecipientInput } from './RecipientInput'
+import { SaveContactDialog } from './SaveContactDialog'
+import { queueTransaction } from '@/lib/transactionQueue'
+import { useTransactionQueueProcessor } from '@/lib/useTransactionQueueProcessor'
 
 const ADDRESS_KIND_LABELS = {
   publicKey: 'Stellar account',
@@ -28,8 +37,7 @@ const ADDRESS_KIND_LABELS = {
   contract: 'Contract address',
 } as const
 
-// Mock holdings (to be replaced by the wallet balance API)
-const sendableAssets: SendableAsset[] = [
+const DEFAULT_SENDABLE_ASSETS: SendableAsset[] = [
   { code: 'XLM', issuer: 'native', balance: 5234.5, reserved: 1.5 },
   {
     code: 'USDC',
@@ -43,9 +51,31 @@ const sendableAssets: SendableAsset[] = [
   },
 ]
 
-export function SendPage() {
+interface SendPageProps {
+  address?: string
+}
+
+export function SendPage({ address: addressProp }: SendPageProps = {}) {
+  const { snapshot } = useWalletBalances(addressProp)
   const { addOptimisticEntry, reconcileEntry, removeOptimisticEntry } = useOptimisticTransactions()
   const toast = useToast()
+  const { contacts, saveContact } = useContacts()
+  const { recents, recordRecipient } = useRecentRecipients()
+  const { processQueue } = useTransactionQueueProcessor()
+  const [saveContactAddress, setSaveContactAddress] = useState<string | null>(null)
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+
+  const sendableAssets: SendableAsset[] = useMemo(() => {
+    if (snapshot?.assets && snapshot.assets.length > 0) {
+      return snapshot.assets.map((asset) => ({
+        code: asset.code,
+        issuer: asset.issuer,
+        balance: asset.balance,
+        reserved: asset.code === 'XLM' || asset.issuer === 'native' ? 1.5 : undefined,
+      }))
+    }
+    return DEFAULT_SENDABLE_ASSETS
+  }, [snapshot])
 
   const [step, setStep] = useState<'form' | 'review' | 'confirmed'>('form')
   const [recipientTouched, setRecipientTouched] = useState(false)
@@ -58,14 +88,50 @@ export function SendPage() {
   })
   const [trustline, setTrustline] = useState<TrustlineCheck | null>(null)
   const [isCheckingTrustline, setIsCheckingTrustline] = useState(false)
+  const [estimatedFee, setEstimatedFee] = useState<NetworkFeeEstimate | null>(null)
+  const [isEstimatingFee, setIsEstimatingFee] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [optimisticId, setOptimisticId] = useState<string | null>(null)
+
+  // Prefill from an incoming payment request link (?destination=...&amount=...).
+  // The destination is validated first; a bad link shows a message instead of
+  // being passed to the API.
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null)
+  useEffect(() => {
+    const parsed = parsePaymentRequest(new URLSearchParams(window.location.search))
+    if (!parsed) return
+    if (!parsed.ok) {
+      setDeepLinkError(parsed.error)
+      return
+    }
+    setFormData((prev) => ({
+      ...prev,
+      recipient: parsed.destination,
+      amount: parsed.amount ?? prev.amount,
+      ...(parsed.memo ? { memoType: 'text' as MemoType, memo: parsed.memo } : {}),
+    }))
+    setRecipientTouched(true)
+  }, [])
+
+  // Track online/offline status
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true)
+    const handleOffline = () => setIsOnline(false)
+
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
 
   const selectedAsset =
     sendableAssets.find((asset) => asset.code === formData.asset) ?? sendableAssets[0]
   const amountCheck = useMemo(
-    () => validateAmount(formData.amount, selectedAsset),
-    [formData.amount, selectedAsset],
+    () => validateAmount(formData.amount, selectedAsset, estimatedFee?.feeInXlm),
+    [formData.amount, selectedAsset, estimatedFee?.feeInXlm],
   )
 
   // Verify the recipient can hold the asset once the review step is reached, so
@@ -87,6 +153,29 @@ export function SendPage() {
 
     return () => controller.abort()
   }, [step, formData.recipient, selectedAsset.code, selectedAsset.issuer])
+
+  // Dynamically estimate network fee based on network conditions and transaction complexity
+  useEffect(() => {
+    if (step !== 'review') return
+
+    const controller = new AbortController()
+    setIsEstimatingFee(true)
+
+    const operationCount = 1
+
+    estimateTransactionFee({ operationCount, signal: controller.signal })
+      .then((fee) => {
+        if (!controller.signal.aborted) setEstimatedFee(fee)
+      })
+      .catch(() => {
+        // Fallback is handled inside estimateTransactionFee
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIsEstimatingFee(false)
+      })
+
+    return () => controller.abort()
+  }, [step, formData.asset, formData.recipient])
 
   const recipientCheck = useMemo(
     () => validateStellarAddress(formData.recipient),
@@ -110,6 +199,50 @@ export function SendPage() {
   const handleConfirm = async () => {
     setIsSubmitting(true)
 
+    const senderWalletId = process.env.NEXT_PUBLIC_SENDER_WALLET_ID
+    if (!senderWalletId) throw new Error('No sender wallet is configured for payments.')
+
+    // Check if offline
+    if (!isOnline) {
+      // Queue transaction for later
+      try {
+        const queuedId = await queueTransaction({
+          recipientAddress: formData.recipient,
+          amount: formData.amount,
+          assetCode: formData.asset,
+          senderWalletId,
+        })
+
+        const txId = addOptimisticEntry({
+          type: 'sent',
+          asset: formData.asset,
+          amount: parseFloat(formData.amount),
+          recipient: formData.recipient,
+          timestamp: new Date(),
+        })
+        setOptimisticId(txId)
+
+        toast.add({
+          title: 'Payment queued',
+          description: `Your ${formData.amount} ${formData.asset} payment will be sent when you're back online.`,
+          type: 'success',
+        })
+
+        setStep('confirmed')
+        recordRecipient(formData.recipient)
+      } catch (error) {
+        toast.add({
+          title: 'Failed to queue payment',
+          description: error instanceof Error ? error.message : 'Please try again.',
+          type: 'error',
+        })
+      } finally {
+        setIsSubmitting(false)
+      }
+      return
+    }
+
+    // Online - submit immediately
     const txId = addOptimisticEntry({
       type: 'sent',
       asset: formData.asset,
@@ -120,9 +253,6 @@ export function SendPage() {
     setOptimisticId(txId)
 
     try {
-      const senderWalletId = process.env.NEXT_PUBLIC_SENDER_WALLET_ID
-      if (!senderWalletId) throw new Error('No sender wallet is configured for payments.')
-
       const baseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || API_BASE_URLS.development).replace(/\/$/, '')
       const response = await fetch(baseUrl + API_PREFIX + '/payments/' + senderWalletId, {
         method: 'POST',
@@ -138,6 +268,7 @@ export function SendPage() {
       if (!response.ok) throw new Error('Payment submission failed (' + response.status + ')')
 
       reconcileEntry(txId)
+      recordRecipient(formData.recipient)
       setOptimisticId(null)
       setStep('confirmed')
       toast.add({
@@ -146,15 +277,71 @@ export function SendPage() {
         type: 'success',
       })
     } catch (error) {
-      removeOptimisticEntry(txId)
-      setOptimisticId(null)
-      toast.add({
-        title: 'Transaction failed',
-        description: error instanceof Error ? error.message : 'Please try again.',
-        type: 'error',
-      })
+      // If network error during online submission, queue it
+      if (error instanceof Error && (error.message.includes('fetch') || error.message.includes('network'))) {
+        try {
+          await queueTransaction({
+            recipientAddress: formData.recipient,
+            amount: formData.amount,
+            assetCode: formData.asset,
+            senderWalletId,
+          })
+
+          toast.add({
+            title: 'Payment queued',
+            description: `Network error occurred. Your ${formData.amount} ${formData.asset} payment will be sent when connection is restored.`,
+            type: 'success',
+          })
+
+          setStep('confirmed')
+          recordRecipient(formData.recipient)
+        } catch (queueError) {
+          removeOptimisticEntry(txId)
+          setOptimisticId(null)
+          toast.add({
+            title: 'Transaction failed',
+            description: error instanceof Error ? error.message : 'Please try again.',
+            type: 'error',
+          })
+        }
+      } else {
+        removeOptimisticEntry(txId)
+        setOptimisticId(null)
+        toast.add({
+          title: 'Transaction failed',
+          description: error instanceof Error ? error.message : 'Please try again.',
+          type: 'error',
+        })
+      }
     } finally {
       setIsSubmitting(false)
+    }
+  }
+
+  // Paste a copied address directly into the recipient field, matching the
+  // trimming behavior of manual typing so pasted whitespace doesn't cause a
+  // spurious validation error.
+  const handlePasteRecipient = async () => {
+    if (!navigator.clipboard?.readText) {
+      toast.add({
+        title: 'Clipboard unavailable',
+        description: 'Your browser does not support pasting from the clipboard here.',
+        type: 'error',
+      })
+      return
+    }
+
+    try {
+      const text = await navigator.clipboard.readText()
+      if (!text.trim()) return
+      setFormData((prev) => ({ ...prev, recipient: text.trim() }))
+      setRecipientTouched(true)
+    } catch {
+      toast.add({
+        title: 'Paste failed',
+        description: 'Allow clipboard access in your browser to paste the address.',
+        type: 'error',
+      })
     }
   }
 
@@ -196,7 +383,9 @@ export function SendPage() {
               </div>
               <div>
                 <p className="text-muted-foreground">Network Fee</p>
-                <p className="text-foreground font-semibold">0.00001 XLM</p>
+                <p className="text-foreground font-semibold">
+                  {estimatedFee?.formattedFee ?? '0.00001 XLM'}
+                </p>
               </div>
             </div>
             <div className="flex gap-3">
@@ -220,6 +409,16 @@ export function SendPage() {
   }
 
   return (
+    <>
+    <SaveContactDialog
+      open={saveContactAddress !== null}
+      address={saveContactAddress ?? ''}
+      onClose={() => setSaveContactAddress(null)}
+      onSave={(label, address) => {
+        saveContact(label, address)
+        toast.add({ title: 'Contact saved', description: `"${label}" added to your contacts.`, type: 'success' })
+      }}
+    />
     <div className="min-h-screen bg-background">
       {/* Header */}
       <div className="border-b border-border bg-card/50 backdrop-blur-sm">
@@ -230,6 +429,12 @@ export function SendPage() {
                 ← Back
               </Button>
             </Link>
+            {!isOnline && (
+              <Badge variant="destructive" className="flex items-center gap-1">
+                <WifiOff size={12} />
+                Offline
+              </Badge>
+            )}
           </div>
           <h1 className="text-3xl font-bold text-foreground">Send Payment</h1>
           <p className="text-muted-foreground mt-1">
@@ -240,101 +445,81 @@ export function SendPage() {
 
       {/* Main Content */}
       <div className="max-w-2xl mx-auto px-6 py-8">
+        {deepLinkError && (
+          <div
+            role="alert"
+            className="mb-6 flex items-start gap-2 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+          >
+            <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            <span>{deepLinkError}</span>
+          </div>
+        )}
+        <TransactionQueueList />
         {/* Progress Steps */}
         <div className="flex items-center justify-center gap-4 mb-12">
-          <div
-            className={`flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all ${
-              step === 'form' || step === 'review' || step === 'confirmed'
-                ? 'bg-primary text-primary-foreground'
-                : 'bg-muted text-muted-foreground'
-            }`}
-          >
+          <div className="flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all bg-primary text-primary-foreground">
             1
           </div>
           <div
             className={`flex-1 h-1 transition-all ${
-              step === 'review' || step === 'confirmed' ? 'bg-primary' : 'bg-muted'
+              step === 'review' ? 'bg-primary' : 'bg-muted'
             }`}
           />
           <div
             className={`flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all ${
-              step === 'review' || step === 'confirmed'
+              step === 'review'
                 ? 'bg-primary text-primary-foreground'
                 : 'bg-muted text-muted-foreground'
             }`}
           >
             2
           </div>
-          <div
-            className={`flex-1 h-1 transition-all ${
-              step === 'confirmed' ? 'bg-primary' : 'bg-muted'
-            }`}
-          />
-          <div
-            className={`flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all ${
-              step === 'confirmed'
-                ? 'bg-primary text-primary-foreground'
-                : 'bg-muted text-muted-foreground'
-            }`}
-          >
+          <div className="flex-1 h-1 transition-all bg-muted" />
+          <div className="flex items-center justify-center w-10 h-10 rounded-full font-semibold transition-all bg-muted text-muted-foreground">
             3
           </div>
         </div>
+
+        {/* Onboarding for new users with no saved or recent recipients */}
+        {step === 'form' && contacts.length === 0 && recents.length === 0 && (
+          <EmptyState
+            illustration="send"
+            title="New to sending payments?"
+            description="You haven't saved any recipients yet. Paste a Stellar address below to send XLM, USDC, or other assets — payments settle in seconds."
+            action={{ label: 'Receive assets first', href: '/receive' }}
+            className="mb-6"
+          />
+        )}
 
         {/* Form Step */}
         {step === 'form' && (
           <form onSubmit={handleSubmit} className="space-y-6">
             <div className="bg-card rounded-xl border border-border p-6 space-y-6">
               <div>
-                <label className="block text-sm font-semibold text-foreground mb-2">
+                <label
+                  htmlFor="recipient-address"
+                  className="block text-sm font-semibold text-foreground mb-2"
+                >
                   Recipient Address
                 </label>
-                <input
-                  type="text"
-                  placeholder="GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-                  className={`w-full px-4 py-3 rounded-lg bg-background border text-foreground placeholder:text-muted-foreground focus:outline-none font-mono text-sm ${
-                    showRecipientError
-                      ? 'border-destructive focus:border-destructive'
-                      : recipientCheck.isValid
-                        ? 'border-green-500/60 focus:border-green-500'
-                        : 'border-border focus:border-primary'
-                  }`}
+                <RecipientInput
                   value={formData.recipient}
-                  onChange={(e) =>
-                    setFormData({ ...formData, recipient: e.target.value.trim() })
-                  }
+                  onChange={(address) => {
+                    setFormData((prev) => ({ ...prev, recipient: address }))
+                    setRecipientTouched(true)
+                  }}
                   onBlur={() => setRecipientTouched(true)}
-                  aria-invalid={showRecipientError}
-                  aria-describedby="recipient-feedback"
-                  autoCapitalize="characters"
-                  spellCheck={false}
-                  required
+                  contacts={contacts}
+                  recents={recents}
+                  isValid={recipientCheck.isValid}
+                  showError={showRecipientError}
+                  errorMessage={recipientCheck.error}
+                  validKindLabel={
+                    recipientCheck.kind ? ADDRESS_KIND_LABELS[recipientCheck.kind] : undefined
+                  }
+                  onPaste={handlePasteRecipient}
+                  onSaveContact={(addr) => setSaveContactAddress(addr)}
                 />
-                <p
-                  id="recipient-feedback"
-                  aria-live="polite"
-                  className={`text-xs mt-2 flex items-center gap-1.5 ${
-                    showRecipientError
-                      ? 'text-destructive'
-                      : recipientCheck.isValid
-                        ? 'text-green-500'
-                        : 'text-muted-foreground'
-                  }`}
-                >
-                  {showRecipientError ? (
-                    <>
-                      <AlertCircle size={13} />
-                      {recipientCheck.error}
-                    </>
-                  ) : recipientCheck.isValid && recipientCheck.kind ? (
-                    <>
-                      <CheckCircle size={13} />
-                      Valid {ADDRESS_KIND_LABELS[recipientCheck.kind]} — checksum verified
-                    </>
-                  ) : (
-                    'The Stellar address you want to send funds to'
-                  )}
-                </p>
               </div>
 
               <AssetAmountPicker
@@ -438,8 +623,10 @@ export function SendPage() {
               </Link>
               <Button
                 type="submit"
+                data-shortcut="send"
                 className="flex-1 bg-primary hover:bg-primary/90"
                 disabled={!canReview}
+                data-testid="send-review-button"
               >
                 <Send className="mr-2 h-4 w-4" />
                 Review Payment
@@ -451,7 +638,7 @@ export function SendPage() {
         {/* Review Step */}
         {step === 'review' && (
           <div className="space-y-6">
-            <div className="bg-card rounded-xl border border-border p-6 space-y-6">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-6" data-testid="send-review-section">
               <h2 className="text-xl font-bold text-foreground">Review Payment</h2>
 
               <div className="space-y-4 bg-muted/30 rounded-lg p-4">
@@ -470,7 +657,16 @@ export function SendPage() {
                 </div>
                 <div className="border-t border-border pt-4 flex items-center justify-between">
                   <span className="text-muted-foreground">Network Fee</span>
-                  <span className="font-semibold text-foreground">0.00001 XLM</span>
+                  {isEstimatingFee ? (
+                    <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                      <Loader2 size={14} className="animate-spin" />
+                      Estimating…
+                    </span>
+                  ) : (
+                    <span className="font-semibold text-foreground">
+                      {estimatedFee?.formattedFee ?? '0.00001 XLM'}
+                    </span>
+                  )}
                 </div>
                 <div className="border-t border-border pt-4 flex items-center justify-between">
                   <span className="text-muted-foreground">Recipient trustline</span>
@@ -513,6 +709,7 @@ export function SendPage() {
                       ? 'bg-yellow-500/10 border-yellow-500/30'
                       : 'bg-destructive/10 border-destructive/30'
                   }`}
+                  data-testid="send-trustline-warning"
                 >
                   <AlertCircle
                     size={20}
@@ -531,7 +728,7 @@ export function SendPage() {
                 </div>
               )}
 
-              <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 flex gap-3">
+              <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 flex gap-3" data-testid="send-review-warning">
                 <AlertCircle size={20} className="text-yellow-500 flex-shrink-0 mt-0.5" />
                 <div className="text-sm text-foreground">
                   <p className="font-semibold">Please review carefully</p>
@@ -554,6 +751,7 @@ export function SendPage() {
                 className="flex-1 bg-primary hover:bg-primary/90"
                 onClick={handleConfirm}
                 disabled={isCheckingTrustline || trustline?.status === 'unfunded' || isSubmitting}
+                data-testid="send-confirm-button"
               >
                 {isSubmitting ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -569,5 +767,6 @@ export function SendPage() {
         )}
       </div>
     </div>
+    </>
   )
 }

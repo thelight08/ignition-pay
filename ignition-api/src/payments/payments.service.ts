@@ -12,6 +12,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { QUEUE_PAYMENTS } from '../queue/queue.constants';
 import { PAYMENT_JOB_PROCESS, PaymentJobPayload } from '../queue/queue.jobs';
+import { DashboardCacheService } from '../users/dashboard-cache.service';
 
 export interface EstimatedFee {
   feeAmount: string;
@@ -26,6 +27,7 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     @InjectQueue(QUEUE_PAYMENTS)
     private readonly paymentQueue: Queue<PaymentJobPayload>,
+    private readonly dashboardCache: DashboardCacheService,
   ) {}
 
   async initiatePayment(
@@ -36,6 +38,10 @@ export class PaymentsService {
       typeof walletIdOrDto === 'string'
         ? { ...dtoParam!, senderWalletId: walletIdOrDto }
         : walletIdOrDto;
+
+    const effectiveKey =
+      dto.idempotencyKey ??
+      `${dto.senderWalletId}:${dto.recipientAddress}:${dto.amount}:${dto.assetCode}`;
 
     // ── 1. Validate sender wallet ────────────────────────────────────────────
     const senderWallet = await this.prisma.wallet.findUnique({
@@ -79,8 +85,6 @@ export class PaymentsService {
           ...(recipientWallet
             ? {}
             : { externalRecipientAddress: dto.recipientAddress }),
-          // Issue #408: store idempotency key so duplicate-initiation guard
-          // can detect retries within the de-dup window.
           idempotencyKey: effectiveKey,
         },
       },
@@ -100,119 +104,12 @@ export class PaymentsService {
         `to=${dto.recipientAddress} amount=${dto.amount} ${dto.assetCode}`,
     );
 
-  private readonly horizonUrl: string;
-
-  constructor(private readonly config: ConfigService) {
-    this.horizonUrl = this.config.get<string>(
-      'HORIZON_URL',
-      'https://horizon.stellar.org',
-    );
-  }
-
-  /**
-   * Fetch the current recommended network fee from Horizon (Issue #245).
-   *
-   * Uses the p50 (median) fee from the last 5 ledgers, converted from
-   * stroops to XLM (1 XLM = 10_000_000 stroops), and returned as a
-   * 7-decimal fixed-point string to match the Stellar decimal precision
-   * convention used throughout this codebase.
-   *
-   * Falls back to the Stellar minimum base fee (100 stroops = 0.00001 XLM)
-   * if Horizon is unreachable.
-   */
-  async estimateFee(): Promise<EstimatedFee> {
-    try {
-      const res = await fetch(`${this.horizonUrl}/fee_stats`);
-      if (!res.ok) {
-        throw new Error(`Horizon /fee_stats responded ${res.status}`);
-      }
-      const stats: HorizonFeeStats = await res.json();
-
-      // p50 is the median fee in stroops across recent ledgers — a good
-      // balance between reliability and cost.
-      const stroops = parseInt(stats.fee_charged?.p50 ?? stats.last_ledger_base_fee, 10);
-      if (!Number.isFinite(stroops) || stroops < 0) {
-        throw new Error(`Unexpected stroops value: ${stroops}`);
-      }
-
-      // Convert stroops → XLM with 7 decimal precision
-      const xlm = (stroops / 10_000_000).toFixed(7);
-
-      return { feeAmount: xlm, feeAssetCode: 'XLM' };
-    } catch (err) {
-      this.logger.warn(
-        `Fee estimation from Horizon failed, using fallback: ${(err as Error).message}`,
-      );
-      // 100 stroops = 0.00001 XLM — Stellar's minimum base fee
-      return { feeAmount: '0.0000100', feeAssetCode: 'XLM' };
-    }
-  }
-
-  /**
-   * Initiate a payment. Fetches the current network fee from Horizon
-   * and includes it in the response so callers can show it before
-   * the user confirms (Issue #245).
-   */
-  async initiatePayment(dto: CreatePaymentDto) {
-  constructor(private readonly prisma: PrismaService) {}
-
-  async initiatePayment(senderWalletId: string, dto: CreatePaymentDto) {
-    // Fetch the sender wallet and verify it exists.
-    const senderWallet = await this.prisma.wallet.findUnique({
-      where: { id: senderWalletId },
-    });
-
-    if (!senderWallet) {
-      throw new NotFoundException('Sender wallet not found');
-    }
-
-    // Issue #242: Reject outgoing transactions when the wallet is SUSPENDED.
-    if (senderWallet.status === 'SUSPENDED') {
-      throw new ForbiddenException(
-        'Outgoing transactions are not allowed: wallet is suspended',
-      );
-    }
-
-    if (senderWallet.status === 'CLOSED') {
-      throw new ForbiddenException(
-        'Outgoing transactions are not allowed: wallet is closed',
-      );
-    }
-
-    // ── Issue #408: Idempotency guard ─────────────────────────────────────
-    // Reject duplicate initiation when the same idempotency key was already
-    // used for a recent PENDING transaction. This prevents network-retry
-    // double-submits from creating duplicate on-chain payments.
-    const effectiveKey =
-      dto.idempotencyKey ?? `${senderWalletId}:${dto.recipientAddress}:${dto.amount}:${dto.assetCode}`;
-    const recentWindowMs = 60 * 1000; // 60-second de-dup window
-    const windowStart = new Date(Date.now() - recentWindowMs);
-
-    const existingPending = await this.prisma.transaction.findFirst({
-      where: {
-        fromWalletId: senderWalletId,
-        status: 'PENDING',
-        createdAt: { gte: windowStart },
-        metadata: {
-          path: ['idempotencyKey'],
-          equals: effectiveKey,
-        },
-      },
-    });
-
-    if (existingPending) {
-      this.logger.warn(
-        `Duplicate payment rejected (idempotencyKey=${effectiveKey}): ` +
-          `existing txn=${existingPending.id}`,
-      );
-      throw new UnprocessableEntityException(
-        `A payment with idempotency key '${effectiveKey}' is already being processed (txn=${existingPending.id}).`,
-      );
-    }
-
-    // amount validity (range, precision) is enforced by @IsDecimalAmount on
-    // CreatePaymentDto — no redundant guard needed here.
-    const { feeAmount, feeAssetCode } = await this.estimateFee();
+    // Issue #591 — a new transaction is a significant event: invalidate the
+    // warmed dashboard cache for both parties so the next load recomputes.
+    await this.invalidateDashboardCaches([
+      senderWallet.userId,
+      recipientWallet?.userId,
+    ]);
 
     return {
       id: transaction.id,
@@ -225,7 +122,27 @@ export class PaymentsService {
     };
   }
 
+
   // ── Private helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Issue #591 — invalidate the warmed dashboard cache for the given users.
+   * Failures are swallowed so a cache problem never blocks a payment.
+   */
+  private async invalidateDashboardCaches(
+    userIds: Array<string | null | undefined>,
+  ): Promise<void> {
+    const unique = [...new Set(userIds.filter((id): id is string => !!id))];
+    await Promise.all(
+      unique.map((userId) =>
+        this.dashboardCache.invalidate(userId).catch((err: any) => {
+          this.logger.warn(
+            `Failed to invalidate dashboard cache for user ${userId}: ${err?.message ?? err}`,
+          );
+        }),
+      ),
+    );
+  }
 
   /**
    * Enforces rolling 24-hour and 30-day outgoing transfer limits for a wallet.

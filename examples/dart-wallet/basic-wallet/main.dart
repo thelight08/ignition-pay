@@ -1,4 +1,12 @@
+import 'dart:io';
 import 'package:stellar/stellar.dart';
+
+Future<bool> checkTrustline(Server server, String accountId, Asset asset) async {
+  if (asset is AssetTypeNative) return true;
+  final account = await server.accounts.account(accountId);
+  return account.balances.any((balance) =>
+      balance.assetCode == asset.code && balance.assetIssuer == asset.issuer);
+}
 
 void main() async {
   final keypair = Keypair.random();
@@ -6,7 +14,7 @@ void main() async {
   print('Secret Seed: ${keypair.secretSeed}');
 
   final server = Server('https://horizon-testnet.stellar.org');
-  await FriendBot.fundTestAccount(keypair.accountId);
+  await Friendot.fundTestAccount(keypair.accountId);
   print('Account funded on testnet');
 
   final account = await server.accounts.account(keypair.accountId);
@@ -14,11 +22,18 @@ void main() async {
     print('Balance: ${balance.assetType} ${balance.balance}');
   }
 
-  final destination = 'GBSH7WNSDU5K3J2I5H3K2M6QZQKJ3PZ7PJ3VJ6QZQKJ3PZ7PJ3VJ6';
+  print('Enter recipient address:');
+  final destination = stdin.readLineSync()!;
+  final asset = AssetTypeNative();
+  final hasTrustline = await checkTrustline(server, destination, asset);
+  if (!hasTrustline) {
+    print('Recipient does not have a trustline for the asset.');
+    return;
+  }
   final transaction = TransactionBuilder(account)
     .addOperation(PaymentOperation(
       destination: destination,
-      asset: AssetTypeNative(),
+      asset: asset,
       amount: '10.0',
     ))
     .build();

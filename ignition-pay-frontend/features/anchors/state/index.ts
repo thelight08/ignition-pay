@@ -14,6 +14,83 @@ import { trackEvent } from '@/lib/analytics'
 
 const POLL_INTERVAL_MS = 3000
 
+/** Where the in-progress selection is kept so a reload, tab reopen or back/forward doesn't lose it. */
+export const SEP24_DRAFT_KEY = 'ignition:sep24-wizard-draft'
+/** A draft older than this is ignored on restore. */
+const DRAFT_MAX_AGE_MS = 30 * 60 * 1000
+/** Marker stored in `history.state` for each wizard step the browser can navigate back to. */
+const HISTORY_MARKER = 'sep24Step'
+
+type ResumableStep = 'operation' | 'form'
+
+export interface Sep24Draft {
+  anchorName: string
+  operation: Sep24Operation | null
+  assetCode: string
+  assetIssuer?: string
+  amount: string
+  step: ResumableStep
+  savedAt: number
+}
+
+export function readSep24Draft(now: number = Date.now()): Sep24Draft | null {
+  try {
+    const raw = window.localStorage.getItem(SEP24_DRAFT_KEY)
+    if (!raw) return null
+    const draft = JSON.parse(raw) as Sep24Draft
+    if (!draft || typeof draft.savedAt !== 'number' || now - draft.savedAt > DRAFT_MAX_AGE_MS) {
+      return null
+    }
+    if (draft.step !== 'operation' && draft.step !== 'form') return null
+    return draft
+  } catch {
+    return null
+  }
+}
+
+function writeSep24Draft(state: Sep24WizardState, step: ResumableStep): void {
+  const draft: Sep24Draft = {
+    anchorName: state.anchorName,
+    operation: state.operation,
+    assetCode: state.assetCode,
+    assetIssuer: state.assetIssuer,
+    amount: state.amount,
+    step,
+    savedAt: Date.now(),
+  }
+  try {
+    window.localStorage.setItem(SEP24_DRAFT_KEY, JSON.stringify(draft))
+  } catch {
+    // Persisting the draft is best-effort.
+  }
+}
+
+function clearSep24Draft(): void {
+  try {
+    window.localStorage.removeItem(SEP24_DRAFT_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+function pushWizardHistory(step: ResumableStep): void {
+  if (typeof window === 'undefined') return
+  window.history.pushState({ ...window.history.state, [HISTORY_MARKER]: step }, '')
+}
+
+function restoreFromDraft(draft: Sep24Draft): Sep24WizardState {
+  return {
+    ...INITIAL_STATE,
+    open: true,
+    anchorName: draft.anchorName,
+    operation: draft.operation,
+    assetCode: draft.assetCode,
+    assetIssuer: draft.assetIssuer,
+    amount: draft.amount,
+    step: draft.step === 'form' && draft.operation ? 'form' : 'operation',
+  }
+}
+
 const INITIAL_STATE: Sep24WizardState = {
   open: false,
   anchorName: '',
@@ -58,8 +135,55 @@ export function useSep24Wizard() {
     return () => clearPolling()
   }, [clearPolling])
 
+  // Resume an unfinished selection after a reload or reopened tab. Done after
+  // mount so server and client markup agree.
+  useEffect(() => {
+    const draft = readSep24Draft()
+    if (draft) setState(restoreFromDraft(draft))
+  }, [])
+
+  // Keep the selection saved while the user is still choosing (before anything
+  // has been sent to the anchor).
+  useEffect(() => {
+    if (state.open && (state.step === 'operation' || state.step === 'form')) {
+      writeSep24Draft(state, state.step)
+    }
+  }, [state])
+
+  // Browser back/forward moves between wizard steps instead of discarding them.
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      const marker = (event.state as Record<string, unknown> | null)?.[HISTORY_MARKER] as
+        | ResumableStep
+        | undefined
+
+      setState((prev) => {
+        if (!prev.open) {
+          // Forward into a wizard entry: bring the saved selection back.
+          const draft = marker ? readSep24Draft() : null
+          if (!draft) return prev
+          const restored = restoreFromDraft(draft)
+          return marker === 'operation' ? { ...restored, step: 'operation' } : restored
+        }
+        // Only the selection steps are navigable; never interrupt a quote or transfer.
+        if (prev.step !== 'operation' && prev.step !== 'form') return prev
+        // Back past the first wizard entry: hide the wizard but keep the draft.
+        if (!marker) return { ...prev, open: false }
+        if (marker === 'operation' && prev.step === 'form') return { ...prev, step: 'operation' }
+        if (marker === 'form' && prev.step === 'operation' && prev.operation) {
+          return { ...prev, step: 'form' }
+        }
+        return prev
+      })
+    }
+
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
   const open = useCallback(
     (anchorName: string, initialOperation?: Sep24Operation) => {
+      pushWizardHistory(initialOperation ? 'form' : 'operation')
       setState({
         ...INITIAL_STATE,
         open: true,
@@ -73,10 +197,12 @@ export function useSep24Wizard() {
 
   const close = useCallback(() => {
     clearPolling()
+    clearSep24Draft()
     setState(INITIAL_STATE)
   }, [clearPolling])
 
   const setOperation = useCallback((operation: Sep24Operation) => {
+    pushWizardHistory('form')
     setState((prev) => ({ ...prev, operation, step: 'form' }))
   }, [])
 

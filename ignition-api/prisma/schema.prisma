@@ -1,3 +1,5 @@
+// Pool sizing (Issue #593): PrismaService appends connection_limit (PRISMA_POOL_SIZE,
+// clamped 5–20) and pool_timeout (from PRISMA_POOL_TIMEOUT_MS) to DATABASE_URL at runtime.
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -215,6 +217,18 @@ model SystemSettings {
   sessionIdleTimeoutSeconds Int @default(1800)
   /// Whether to enable session persistence (extend session on activity)
   sessionPersistenceEnabled Boolean @default(true)
+  /// Maximum address-generation requests per IP in the configured throttle window.
+  addressGenerationThrottleLimit Int @default(5)
+  /// Address-generation throttle TTL in seconds.
+  addressGenerationThrottleTtlSeconds Int @default(60)
+  /// Alert threshold for per-IP address-generation throttle consumption (percent of limit).
+  addressGenerationThrottleAlertThresholdPercent Int @default(80)
+  /// Minimum sustained breach duration before a sustained-breach alert is emitted.
+  addressGenerationThrottleSustainedBreachMinutes Int @default(5)
+  /// Minimum unique IPs throttled within 1 minute before a rate-alert is emitted.
+  addressGenerationThrottleUniqueIpsThreshold Int @default(50)
+  /// Cooldown period in minutes between repeated throttle alerts.
+  addressGenerationThrottleAlertCooldownMinutes Int @default(10)
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 
@@ -605,4 +619,42 @@ model DepositAddress {
   @@index([status])
   @@index([network])
   @@map("deposit_addresses")
+}
+enum WebhookAlgorithm {
+  RSA_SHA256
+  ECDSA_SHA256
+  HMAC_SHA256
+}
+
+/// AnchorConfig stores per-anchor SEP-24 webhook verification credentials.
+/// webhookSecret    – HMAC shared secret (hex or base64 encoded).
+/// webhookPublicKey – PEM-encoded RSA or ECDSA public key for asymmetric algos.
+/// algorithm        – Which signature scheme the anchor uses.
+model AnchorConfig {
+  id               String           @id @default(uuid())
+  /// Unique slug identifying the anchor (e.g. "circle", "moneygram")
+  anchorId         String           @unique
+  /// Human-readable name for display
+  name             String
+  /// Base URL of the anchor (e.g. "https://api.myanchor.com")
+  baseUrl          String
+  algorithm        WebhookAlgorithm @default(HMAC_SHA256)
+  /// HMAC_SHA256: hex- or base64-encoded shared secret
+  webhookSecret    String?
+  /// Issue #618: the retired HMAC secret, accepted only while the grace period
+  /// below is still open, so rotating a secret does not drop in-flight
+  /// deliveries. Set both rotation columns together, then clear them once the
+  /// grace period has passed.
+  previousWebhookSecret String?
+  /// Issue #618: when previousWebhookSecret stops being accepted.
+  previousWebhookSecretExpiresAt DateTime?
+  /// RSA_SHA256 / ECDSA_SHA256: PEM-encoded public key
+  webhookPublicKey String?
+  isActive         Boolean          @default(true)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([anchorId])
+  @@index([isActive])
+  @@map("anchor_configs")
 }
